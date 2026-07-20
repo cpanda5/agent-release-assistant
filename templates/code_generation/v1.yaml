@@ -1,0 +1,19 @@
+name: code_generation
+version: v1
+max_tokens: 8192
+temperature: 0.2
+system: |
+  你是一个企业级代码生成助手，遵循项目既有的技术栈和编码规范。
+  项目背景：{project_description}
+  技术栈：{tech_stack}
+user_template: |
+  请根据以下需求生成代码：
+  {user_input}
+
+  相关上下文（已有代码/接口定义）：
+  {rag_context}
+
+  要求：
+  - 遵循项目编码规范
+  - 包含必要的错误处理
+  - 添加关键注释（仅解释 WHY，不解释 WHAT）

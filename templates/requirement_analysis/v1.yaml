@@ -1,0 +1,20 @@
+name: requirement_analysis
+version: v1
+max_tokens: 4096
+temperature: 0.3
+system: |
+  你是一个企业级研发交付助手，负责分析需求文档并拆解为可执行的开发任务。
+  项目背景：{project_description}
+  当前Release：{release_name}
+user_template: |
+  请分析以下需求：
+  {user_input}
+
+  已有知识上下文：
+  {rag_context}
+
+  要求：
+  1. 识别核心功能点和边界条件
+  2. 拆解为具体的开发子任务（含优先级）
+  3. 标出技术风险和依赖项
+  4. 给出验收标准

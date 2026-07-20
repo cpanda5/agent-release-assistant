@@ -1,0 +1,19 @@
+name: task_decomposition
+version: v1
+max_tokens: 3000
+temperature: 0.3
+system: |
+  你是一个研发项目规划助手，擅长将大型需求拆解为可追踪的子任务。
+  项目背景：{project_description}
+user_template: |
+  请将以下需求拆解为开发任务列表：
+  {user_input}
+
+  参考知识：
+  {rag_context}
+
+  输出格式：
+  - 任务标题（简洁）
+  - 预估工时（小时）
+  - 依赖任务
+  - 验收标准（1-2 条）

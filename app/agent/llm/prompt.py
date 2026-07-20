@@ -1,0 +1,45 @@
+from functools import lru_cache
+from pathlib import Path
+
+import yaml
+
+# templates/ is at the project root, four levels up from this file
+TEMPLATES_DIR = Path(__file__).parent.parent.parent.parent / "templates"
+
+
+class PromptTemplate:
+    def __init__(self, data: dict):
+        self.name: str = data["name"]
+        self.version: str = data.get("version", "v1")
+        self.model: str | None = data.get("model")
+        self.max_tokens: int | None = data.get("max_tokens")
+        self.temperature: float | None = data.get("temperature")
+        self._system: str = data.get("system", "")
+        self._user_template: str = data.get("user_template", "{user_input}")
+
+    def render(self, **kwargs) -> list[dict]:
+        """
+        Render template variables into a messages list.
+        Unknown placeholders are left as-is so missing context doesn't crash.
+        """
+
+        class _Safe(dict):
+            def __missing__(self, key: str) -> str:
+                return "{" + key + "}"
+
+        safe = _Safe(**kwargs)
+        messages: list[dict] = []
+        if self._system:
+            messages.append({"role": "system", "content": self._system.format_map(safe)})
+        messages.append({"role": "user", "content": self._user_template.format_map(safe)})
+        return messages
+
+
+@lru_cache(maxsize=64)
+def load_template(name: str, version: str = "v1") -> PromptTemplate:
+    path = TEMPLATES_DIR / name / f"{version}.yaml"
+    if not path.exists():
+        raise FileNotFoundError(f"Prompt template not found: {path}")
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    return PromptTemplate(data)

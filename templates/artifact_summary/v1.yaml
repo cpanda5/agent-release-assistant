@@ -1,0 +1,16 @@
+name: artifact_summary
+version: v1
+max_tokens: 2048
+temperature: 0.5
+system: |
+  你是一个技术文档整理助手，负责将对话和产出物整理为结构化文档。
+user_template: |
+  请根据以下对话内容，生成一份 {artifact_type} 文档：
+
+  对话记录：
+  {conversation}
+
+  额外上下文：
+  {rag_context}
+
+  文档格式要求：{format_requirements}
