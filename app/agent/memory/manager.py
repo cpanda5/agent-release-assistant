@@ -103,20 +103,26 @@ class MemoryManager:
         *,
         session_id: str,
         role: str,
-        content: str,
+        content: str | None = None,
         token_count: int = 0,
         trace_id: str | None = None,
         release_id: int | None = None,
         project_id: int | None = None,
+        tool_calls: list[dict] | None = None,
+        tool_call_id: str | None = None,
     ) -> None:
         """
         1. Append to in-process WorkingMemory.
         2. Persist to MySQL message table (fire-and-forget).
         """
+        import json as _json
         wm = _work_layer.get_or_create(session_id)
+        persist_content = content or ""
+        if tool_calls and not content:
+            persist_content = _json.dumps(tool_calls, ensure_ascii=False)
         if token_count == 0:
-            token_count = estimate_tokens(content)
-        wm.append(role, content, trace_id)
+            token_count = estimate_tokens(persist_content)
+        wm.append(role, content, trace_id, tool_calls=tool_calls, tool_call_id=tool_call_id)
 
         # Persist without blocking the response path
         asyncio.create_task(
@@ -125,10 +131,40 @@ class MemoryManager:
                 release_id=release_id,
                 project_id=project_id,
                 role=role,
-                content=content,
+                content=persist_content,
                 token_count=token_count,
                 trace_id=trace_id,
             )
+        )
+
+    # ------------------------------------------------------------------ #
+    # update_release_context_with_artifact                                 #
+    # ------------------------------------------------------------------ #
+
+    async def update_release_context_with_artifact(
+        self,
+        *,
+        release_id: int,
+        session_id: str,
+        artifact: dict,
+    ) -> None:
+        """
+        Called by GenerateArtifactTool after a successful artifact creation.
+        Appends an artifact mention to the release progress summary so future
+        sessions know what has already been produced.
+        """
+        existing = await _rel_layer.load_release_context(release_id) or {}
+        artifact_note = f"[交付物] {artifact.get('type', '')}：{artifact.get('title', '')} (id={artifact.get('artifact_id', '')})"
+        prev_summary = existing.get("progress_summary", "")
+        new_summary = (prev_summary + "\n" + artifact_note).strip() if prev_summary else artifact_note
+        new_summary = _truncate_to_tokens(new_summary, _RELEASE_CTX_MAX)
+        await _rel_layer.upsert_release_context(
+            release_id=release_id,
+            progress_summary=new_summary,
+            key_decisions=existing.get("key_decisions"),
+            pending_tasks=existing.get("pending_tasks"),
+            tech_constraints=existing.get("tech_constraints"),
+            last_updated_by=session_id,
         )
 
     # ------------------------------------------------------------------ #

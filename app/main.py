@@ -24,6 +24,10 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("MySQL pool init failed — traces will be skipped")
 
+    from app.agent.tools import register_all_tools
+    register_all_tools()
+    logger.info("Tool registry initialised")
+
     yield
 
     if settings.mysql_host:

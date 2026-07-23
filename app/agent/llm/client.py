@@ -96,6 +96,70 @@ class LLMClient:
             await write_trace(ctx, result)
 
     # ------------------------------------------------------------------ #
+    # Public: tool-calling complete                                        #
+    # ------------------------------------------------------------------ #
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        *,
+        model: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        session_id: int | None = None,
+        release_id: int | None = None,
+        project_id: int | None = None,
+    ) -> tuple[str | None, list[dict] | None, dict, str]:
+        """
+        Call LLM with tool definitions.
+
+        Returns (text, tool_calls, usage, trace_id).
+        Exactly one of text / tool_calls is non-None:
+        - text is set when the LLM produces a final answer (finish_reason=stop)
+        - tool_calls is set when the LLM wants to invoke tools (finish_reason=tool_calls)
+        """
+        req_model = model or settings.model
+        req_max_tokens = max_tokens or settings.max_tokens
+
+        ctx = TraceContext(
+            requested_model=req_model,
+            session_id=session_id,
+            release_id=release_id,
+            project_id=project_id,
+            is_streaming=False,
+            temperature=temperature,
+            max_tokens=req_max_tokens,
+        )
+        result = TraceResult(model=req_model)
+
+        try:
+            (text, tool_calls, usage), retry_log, actual_model = await self._call_with_tools_fallback(
+                messages, tools, req_model, req_max_tokens, temperature
+            )
+            result.model = actual_model
+            if actual_model != req_model:
+                result.fallback_model = req_model
+                result.fallback_reason = "model_overloaded_or_context_too_long"
+                result.status = "fallback"
+            result.prompt_tokens = usage.get("input_tokens", 0)
+            result.completion_tokens = usage.get("output_tokens", 0)
+            result.total_tokens = result.prompt_tokens + result.completion_tokens
+            result.retry_count = len(retry_log)
+            result.retry_reasons = retry_log
+            result.finish_reason = usage.get("finish_reason", "stop")
+            result.latency_ms = ctx.elapsed_ms()
+            return text, tool_calls, usage, ctx.trace_id
+        except LLMError as e:
+            result.status = "failed"
+            result.error_type = e.error_type
+            result.error_message = str(e)[:512]
+            result.latency_ms = ctx.elapsed_ms()
+            raise
+        finally:
+            await write_trace(ctx, result)
+
+    # ------------------------------------------------------------------ #
     # Public: streaming                                                    #
     # ------------------------------------------------------------------ #
 
@@ -229,6 +293,75 @@ class LLMClient:
             if temperature is not None:
                 kwargs["temperature"] = temperature
             return await self._http.chat.completions.create(**kwargs)
+        except Exception as exc:
+            raise classify_error(exc) from exc
+
+
+    async def _call_with_tools_fallback(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        req_model: str,
+        max_tokens: int,
+        temperature: float | None,
+    ) -> tuple[tuple[str | None, list[dict] | None, dict], list[dict], str]:
+        chain = [req_model]
+        if settings.fallback_model and settings.fallback_model != req_model:
+            chain.append(settings.fallback_model)
+
+        last_err: LLMError | None = None
+        for model in chain:
+            try:
+                (text, tool_calls, usage), retry_log = await with_retry(
+                    lambda m=model: self._single_call_with_tools(m, messages, max_tokens, temperature, tools)
+                )
+                return (text, tool_calls, usage), retry_log, model
+            except LLMError as e:
+                last_err = e
+                if e.category != LLMErrorCategory.FALLBACK:
+                    raise
+        raise last_err  # type: ignore[misc]
+
+    async def _single_call_with_tools(
+        self,
+        model: str,
+        messages: list[dict],
+        max_tokens: int,
+        temperature: float | None,
+        tools: list[dict],
+    ) -> tuple[str | None, list[dict] | None, dict]:
+        try:
+            kwargs: dict = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "tools": tools,
+                "tool_choice": "auto",
+            }
+            if temperature is not None:
+                kwargs["temperature"] = temperature
+            completion = await self._http.chat.completions.create(**kwargs)
+            choice = completion.choices[0]
+            usage = {
+                "input_tokens": completion.usage.prompt_tokens if completion.usage else 0,
+                "output_tokens": completion.usage.completion_tokens if completion.usage else 0,
+                "finish_reason": choice.finish_reason or "stop",
+            }
+            raw_tool_calls = getattr(choice.message, "tool_calls", None)
+            if raw_tool_calls:
+                tool_calls = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in raw_tool_calls
+                ]
+                return None, tool_calls, usage
+            return choice.message.content or "", None, usage
         except Exception as exc:
             raise classify_error(exc) from exc
 

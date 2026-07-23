@@ -30,9 +30,23 @@ class WorkingMemory:
     # Append                                                               #
     # ------------------------------------------------------------------ #
 
-    def append(self, role: str, content: str, trace_id: str | None = None) -> Message:
-        tokens = estimate_tokens(content)
-        msg = Message(role=role, content=content, token_count=tokens, trace_id=trace_id)
+    def append(
+        self,
+        role: str,
+        content: str | None,
+        trace_id: str | None = None,
+        tool_calls: list[dict] | None = None,
+        tool_call_id: str | None = None,
+    ) -> Message:
+        tokens = estimate_tokens(content or "")
+        msg = Message(
+            role=role,
+            content=content,
+            token_count=tokens,
+            trace_id=trace_id,
+            tool_calls=tool_calls,
+            tool_call_id=tool_call_id,
+        )
         self.messages.append(msg)
         self.total_estimated_tokens += tokens
         return msg
@@ -85,7 +99,12 @@ class WorkingMemory:
         """All messages serialised for session-close summarisation."""
         lines = []
         for m in self.messages:
-            lines.append(f"[{m.role}]: {m.content}")
+            if m.role == "tool":
+                lines.append(f"[tool result]: {m.content}")
+            elif m.role == "assistant" and m.tool_calls and not m.content:
+                lines.append(f"[assistant]: (called tools)")
+            else:
+                lines.append(f"[{m.role}]: {m.content or ''}")
         return "\n".join(lines)
 
 

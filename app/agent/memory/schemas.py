@@ -3,10 +3,12 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Message:
-    role: str           # "system" | "user" | "assistant"
-    content: str
+    role: str                         # "system" | "user" | "assistant" | "tool"
+    content: str | None               # None is valid for assistant turn that only has tool_calls
     token_count: int = 0
     trace_id: str | None = None
+    tool_calls: list[dict] | None = None   # set on assistant messages that trigger tool use
+    tool_call_id: str | None = None        # set on tool-result messages
 
 
 @dataclass
@@ -33,5 +35,19 @@ class AgentContext:
 
     def to_llm_messages(self) -> list[dict]:
         result = [{"role": "system", "content": self.system_prompt}]
-        result += [{"role": m.role, "content": m.content} for m in self.messages]
+        for m in self.messages:
+            if m.role == "tool":
+                result.append({
+                    "role": "tool",
+                    "tool_call_id": m.tool_call_id,
+                    "content": m.content or "",
+                })
+            elif m.role == "assistant" and m.tool_calls:
+                result.append({
+                    "role": "assistant",
+                    "content": m.content,  # may be None
+                    "tool_calls": m.tool_calls,
+                })
+            else:
+                result.append({"role": m.role, "content": m.content or ""})
         return result
