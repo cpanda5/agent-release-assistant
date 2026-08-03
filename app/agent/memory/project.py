@@ -1,8 +1,9 @@
 """
-Layer 3: Project Memory — interface stub.
+Layer 3: Project Memory — delegates to the RAG retriever.
 
-Module 4 implements this with vector search (RAG).
-AgentContext already has a rag_chunks field so the caller doesn't change.
+The actual vector search lives in ``app/agent/rag`` (currently a placeholder).
+AgentContext already has a ``rag_chunks`` field so callers don't change when the
+real Qdrant-backed retriever is implemented.
 """
 from app.agent.memory.schemas import KnowledgeChunk
 
@@ -15,12 +16,33 @@ class ProjectMemory:
         raise NotImplementedError
 
 
-class _NoopProjectMemory(ProjectMemory):
+class _RagProjectMemory(ProjectMemory):
+    """Bridges the legacy KnowledgeChunk API onto the LangChain retriever."""
+
     async def search(self, query: str, project_id: str) -> list[KnowledgeChunk]:
-        return []
+        from app.agent.rag import retrieve
+
+        pid = _maybe_int(project_id)
+        docs = await retrieve(query, project_id=pid)
+        return [
+            KnowledgeChunk(
+                content=d.page_content,
+                source=str(d.metadata.get("source", "")),
+                score=float(d.metadata.get("score", 0.0)),
+            )
+            for d in docs
+        ]
 
     async def ingest(self, content: str, metadata: dict) -> str:
+        # TODO(rag): chunk + embed + upsert into Qdrant with release/project metadata.
         return ""
 
 
-project_memory = _NoopProjectMemory()
+def _maybe_int(value) -> int | None:
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+project_memory = _RagProjectMemory()

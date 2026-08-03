@@ -1,12 +1,12 @@
 import json
 from uuid import uuid4
 
-import openai
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from app.agent.core import AgentRunner
-from app.agent.llm import SYSTEM_PROMPT, llm_client
+from app.agent.core import AgentRunner, invoke_agent
+from app.agent.llm import SYSTEM_PROMPT, llm_gateway
+from app.agent.llm.callbacks import trace_callback
 from app.agent.llm.errors import LLMError
 from app.agent.memory import memory_manager
 from app.schemas.agent import (
@@ -28,56 +28,66 @@ _runner = AgentRunner()
 async def run_agent(request: AgentRunRequest) -> AgentRunResponse:
     try:
         return await _runner.run(request)
-    except openai.AuthenticationError:
-        raise HTTPException(status_code=401, detail="Invalid DASHSCOPE_API_KEY.")
-    except openai.RateLimitError:
-        raise HTTPException(status_code=429, detail="Rate limit reached. Retry later.")
-    except openai.APIStatusError as e:
-        raise HTTPException(status_code=502, detail=f"LLM error: {e.message}")
+    except LLMError as e:
+        _raise_http(e)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── /agent/chat — sync ────────────────────────────────────────────────────── #
+# ── /agent/chat — sync (full LangGraph workflow) ─────────────────────────── #
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
-    session_id = request.session_id or str(uuid4())
-    messages = _build_chat_messages(request)
     try:
-        text, usage, trace_id = await llm_client.complete(
-            messages,
-            prompt_template=request.prompt_template,
-            prompt_template_version=request.prompt_template_version,
-        )
+        result = await invoke_agent(request)
     except LLMError as e:
         _raise_http(e)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     return ChatResponse(
-        response=text,
-        session_id=session_id,
-        trace_id=trace_id,
+        response=result.final_text,
+        session_id=result.session_id,
+        trace_id=result.trace_id,
         usage=UsageInfo(
-            input_tokens=usage.get("input_tokens", 0),
-            output_tokens=usage.get("output_tokens", 0),
+            input_tokens=result.usage.get("input_tokens", 0),
+            output_tokens=result.usage.get("output_tokens", 0),
         ),
     )
 
 
-# ── /agent/chat/stream — SSE ─────────────────────────────────────────────── #
+# ── /agent/chat/stream — SSE (direct model stream) ───────────────────────── #
 
 @router.post("/chat/stream")
 async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    """
+    Lightweight streaming endpoint: streams a single model turn (no tool loop).
+    Emits reasoning deltas separately from answer deltas so a client can render
+    qwen3.7 deep-thinking when ``enable_thinking`` is on.
+    """
     session_id = request.session_id or str(uuid4())
     messages = _build_chat_messages(request)
+    run_metadata = {
+        "session_id": session_id,
+        "release_id": request.release_id,
+        "project_id": request.project_id,
+        "trace_id": str(uuid4()),
+    }
 
     async def sse_generator():
         try:
-            async for chunk in llm_client.stream(
+            async for delta in llm_gateway.astream(
                 messages,
-                prompt_template=request.prompt_template,
-                prompt_template_version=request.prompt_template_version,
+                model=request.model,
+                thinking=request.enable_thinking,
+                callbacks=[trace_callback],
+                run_metadata=run_metadata,
             ):
-                yield f"data: {json.dumps({'text': chunk, 'session_id': session_id})}\n\n"
+                payload = {"session_id": session_id}
+                if delta.get("reasoning"):
+                    payload["reasoning"] = delta["reasoning"]
+                if delta.get("content"):
+                    payload["text"] = delta["content"]
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
         except LLMError as e:
             yield f"data: {json.dumps({'error': e.error_type, 'detail': str(e)})}\n\n"
         finally:
@@ -119,7 +129,7 @@ def _build_chat_messages(request: ChatRequest) -> list[dict]:
 
 
 def _raise_http(e: LLMError) -> None:
-    from app.agent.llm.errors import LLMErrorCategory, LLMErrorType
+    from app.agent.llm.errors import LLMErrorType
 
     code_map = {
         LLMErrorType.AUTH_ERROR: 401,

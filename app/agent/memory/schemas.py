@@ -21,7 +21,7 @@ class KnowledgeChunk:
 @dataclass
 class AgentContext:
     """
-    The assembled context passed to LLMClient.complete().
+    The assembled context consumed by the graph's load_memory node.
 
     system_prompt  — base prompt + release progress injection
     messages       — compressed working memory (ready for LLM)

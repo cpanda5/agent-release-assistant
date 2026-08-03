@@ -1,16 +1,25 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# The three unified Qwen3.7 models the service exposes. Users may pick any of
+# these per request; anything else falls back to `default_model`.
+ALLOWED_MODELS: frozenset[str] = frozenset(
+    {"qwen3.7-max", "qwen3.7-plus", "qwen3.7-flash"}
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     # LLM
     dashscope_api_key: str = ""
-    model: str = "qwen3-6-flash"          # 主模型（当前：免费快速推理）
-    # model: str = "qwen-plus"            # 可选：更强，适合复杂分析
-    # model: str = "qwen-max"             # 可选：最强，适合代码生成
-    fallback_model: str = "qwen-turbo"    # 降级模型（主模型过载或 context 超长时切换）
+    llm_base_url: str = (
+        "https://llm-6qoqdsrsqplw1w8w.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+    )
+    model: str = "qwen3.7-flash"          # 默认主模型（快速）
+    default_model: str = "qwen3.7-flash"  # 非法 model 时回落
+    fallback_model: str = "qwen3.7-plus"  # 主模型过载/context 超长时降级
     max_tokens: int = 5000
+    enable_thinking: bool = False         # qwen3.7 深度思考（默认关闭）
     debug: bool = False
 
     # MySQL
@@ -19,6 +28,12 @@ class Settings(BaseSettings):
     mysql_user: str = "root"
     mysql_password: str = ""
     mysql_db: str = "agent_release"
+
+    def resolve_model(self, name: str | None) -> str:
+        """Validate a requested model name, falling back to the default."""
+        if name and name in ALLOWED_MODELS:
+            return name
+        return self.default_model
 
 
 settings = Settings()

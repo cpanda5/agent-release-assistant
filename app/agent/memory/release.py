@@ -8,27 +8,75 @@ import json
 import logging
 import uuid as _uuid
 
+from app.agent.identity import cache_session_pk, resolve_session_pk
 from app.db import get_db_pool
 
 logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------ #
-# message table                                                        #
+# sessions table                                                       #
+# ------------------------------------------------------------------ #
+
+async def ensure_session(
+    *,
+    session_id: str,
+    release_id: int | None,
+    user_id: str | None,
+) -> int | None:
+    """
+    Idempotently register a session by its UUID and return its BIGINT id.
+
+    Uses the ``LAST_INSERT_ID(id)`` upsert trick so ``cur.lastrowid`` yields the
+    id on both insert and duplicate. Caches uuid → id for later writers.
+    """
+    pool = get_db_pool()
+    if pool is None:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO sessions (uuid, release_id, user_id)
+                    VALUES (%s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        id         = LAST_INSERT_ID(id),
+                        release_id = COALESCE(VALUES(release_id), release_id),
+                        user_id    = COALESCE(VALUES(user_id), user_id)
+                    """,
+                    (session_id, release_id, user_id),
+                )
+                await conn.commit()
+                pk = cur.lastrowid
+                if pk:
+                    cache_session_pk(session_id, pk)
+                return pk
+    except Exception:
+        logger.exception("Failed to ensure session=%s", session_id)
+        return None
+
+
+# ------------------------------------------------------------------ #
+# messages table                                                       #
 # ------------------------------------------------------------------ #
 
 async def persist_message(
     *,
-    session_id: int,
-    release_id: int | None,
-    project_id: int | None,
+    session_id: str,
     role: str,
     content: str,
     token_count: int,
     trace_id: str | None,
+    content_type: str = "text",
+    tool_call_id: str | None = None,
 ) -> None:
+    """Insert one row into `message`, resolving the session UUID to its BIGINT id."""
     pool = get_db_pool()
     if pool is None:
+        return
+    session_pk = await resolve_session_pk(session_id)
+    if session_pk is None:
         return
     try:
         async with pool.acquire() as conn:
@@ -36,12 +84,14 @@ async def persist_message(
                 await cur.execute(
                     """
                     INSERT INTO message
-                        (uuid, session_id, release_id, project_id, role, content, token_count, trace_id)
+                        (uuid, session_id, role, content, content_type,
+                         tool_call_id, llm_trace_id, token_count)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
-                        str(_uuid.uuid4()), session_id, release_id, project_id,
-                        role, content, token_count, trace_id,
+                        str(_uuid.uuid4()), session_pk,
+                        role, content, content_type,
+                        tool_call_id, trace_id, token_count,
                     ),
                 )
                 await conn.commit()
@@ -55,7 +105,7 @@ async def persist_message(
 
 async def write_session_summary(
     *,
-    session_id: int,
+    session_id: str,
     release_id: int,
     summary: str,
     key_decisions: list[str] | None = None,
@@ -64,6 +114,9 @@ async def write_session_summary(
 ) -> None:
     pool = get_db_pool()
     if pool is None:
+        return
+    session_pk = await resolve_session_pk(session_id)
+    if session_pk is None:
         return
     try:
         async with pool.acquire() as conn:
@@ -80,7 +133,7 @@ async def write_session_summary(
                         token_count          = VALUES(token_count)
                     """,
                     (
-                        str(_uuid.uuid4()), session_id, release_id,
+                        str(_uuid.uuid4()), session_pk, release_id,
                         summary,
                         json.dumps(key_decisions or [], ensure_ascii=False),
                         json.dumps(artifacts_generated or [], ensure_ascii=False),

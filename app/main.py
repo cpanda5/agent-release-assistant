@@ -52,5 +52,5 @@ async def root():
         "service": "Agent Release Assistant",
         "version": "0.1.0",
         "docs": "/docs",
-        "phase": "Phase 1 — LLM Core",
+        "engine": "LangGraph workflow (planner → rag → agent ⇄ tools → memory)",
     }

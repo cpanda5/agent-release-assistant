@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class TraceContext:
     """Immutable request-side context captured before the LLM call."""
     trace_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    session_id: int | None = None
+    session_id: str | None = None
     release_id: int | None = None
     project_id: int | None = None
     requested_model: str = ""
@@ -55,6 +55,9 @@ async def write_trace(ctx: TraceContext, result: TraceResult) -> None:
     if pool is None:
         logger.debug("DB pool unavailable, skipping trace %s", ctx.trace_id)
         return
+    from app.agent.identity import resolve_session_pk
+
+    session_pk = await resolve_session_pk(ctx.session_id)
     try:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -81,7 +84,7 @@ async def write_trace(ctx: TraceContext, result: TraceResult) -> None:
                     )
                     """,
                     (
-                        ctx.trace_id, ctx.session_id, ctx.release_id, ctx.project_id,
+                        ctx.trace_id, session_pk, ctx.release_id, ctx.project_id,
                         result.model, ctx.requested_model, result.fallback_model, result.fallback_reason,
                         ctx.prompt_template, ctx.prompt_template_version, ctx.system_prompt_hash,
                         result.prompt_tokens, result.completion_tokens, result.total_tokens, result.cost_usd,

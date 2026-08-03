@@ -9,7 +9,7 @@ Three public methods:
 import asyncio
 import logging
 
-from app.agent.llm.client import SYSTEM_PROMPT, llm_client
+from app.agent.llm.gateway import SYSTEM_PROMPT, llm_gateway
 from app.agent.memory import project as _proj_layer
 from app.agent.memory import release as _rel_layer
 from app.agent.memory import working as _work_layer
@@ -124,17 +124,41 @@ class MemoryManager:
             token_count = estimate_tokens(persist_content)
         wm.append(role, content, trace_id, tool_calls=tool_calls, tool_call_id=tool_call_id)
 
+        # content_type mirrors the `message` table enum (text / tool_call / tool_result)
+        if role == "tool":
+            content_type = "tool_result"
+        elif tool_calls:
+            content_type = "tool_call"
+        else:
+            content_type = "text"
+
         # Persist without blocking the response path
         asyncio.create_task(
             _rel_layer.persist_message(
-                session_id=_int_or_zero(session_id),
-                release_id=release_id,
-                project_id=project_id,
+                session_id=session_id,
                 role=role,
                 content=persist_content,
                 token_count=token_count,
                 trace_id=trace_id,
+                content_type=content_type,
+                tool_call_id=tool_call_id,
             )
+        )
+
+    # ------------------------------------------------------------------ #
+    # ensure_session                                                       #
+    # ------------------------------------------------------------------ #
+
+    async def ensure_session(
+        self,
+        *,
+        session_id: str,
+        release_id: int | None = None,
+        user_id: str | None = None,
+    ) -> int | None:
+        """Register the session row and return its BIGINT id (cached for writers)."""
+        return await _rel_layer.ensure_session(
+            session_id=session_id, release_id=release_id, user_id=user_id
         )
 
     # ------------------------------------------------------------------ #
@@ -195,7 +219,7 @@ class MemoryManager:
 
         if release_id:
             await _rel_layer.write_session_summary(
-                session_id=_int_or_zero(session_id),
+                session_id=session_id,
                 release_id=release_id,
                 summary=summary,
                 key_decisions=key_decisions,
@@ -272,11 +296,8 @@ async def _generate_session_summary(text: str) -> tuple[str, list[str]]:
     )
     try:
         import json as _json
-        text_out, _, _ = await llm_client.complete(
-            [{"role": "user", "content": prompt}],
-            max_tokens=600,
-            temperature=0.1,
-        )
+        ai = await llm_gateway.ainvoke([{"role": "user", "content": prompt}])
+        text_out = ai.text
         # Try to parse structured output; fall back to raw text
         start = text_out.find("{")
         end = text_out.rfind("}") + 1
@@ -309,10 +330,3 @@ async def _update_release_context(
         tech_constraints=existing.get("tech_constraints"),
         last_updated_by=session_id,
     )
-
-
-def _int_or_zero(value: str) -> int:
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        return 0

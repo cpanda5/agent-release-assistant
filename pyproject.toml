@@ -12,6 +12,10 @@ dependencies = [
     "aiomysql>=0.2.0",
     "pyyaml>=6.0",
     "tiktoken>=0.7.0",
+    "langgraph>=0.2.0",
+    "langchain>=0.3.0",
+    "langchain-core>=0.3.0",
+    "langchain-openai>=0.2.0",
 ]
 
 [project.scripts]
