@@ -1,33 +1,16 @@
 """
-Release-aware RAG retriever — **interface placeholder**.
+Release-aware hybrid retriever.
 
-The concrete vector store (Qdrant) + embedding + ingestion pipeline is deferred
-to a dedicated later design. This module defines the *contract* the rest of the
-system codes against so nothing else has to change when the real implementation
-lands.
+    query → metadata filter (scope→release_id / project_id)
+          → Qdrant hybrid (dense bge-m3 + sparse BM25, RRF fusion)
+          → bge-reranker-v2-m3 → top_k
+          → Documents(page_content, metadata={document_id, chunk_id, source, score, scope})
 
-Contract / future design
--------------------------
-Documents (colleague-uploaded Markdown, PRDs, design docs) are ingested with
-metadata::
-
-    {"scope": "release" | "project", "release_id": int, "project_id": int, "source": str}
-
-Retrieval is **metadata-filtered** so:
-
-  * ``scope="release"`` recalls only documents tagged with the *current*
-    ``release_id`` — no cross-release contamination.
-  * ``scope="project"`` recalls project-wide shared knowledge by ``project_id``.
-
-Planned implementation (later):
-  * Embedding: DashScope ``text-embedding-v*`` (same API key).
-  * Vector store: Qdrant, one collection with a payload index on
-    ``release_id`` / ``project_id`` / ``scope`` for cheap filtering.
-  * Ingestion: MD → split (recursive/markdown splitter) → embed → upsert with the
-    metadata above.
-
-Until then every method returns empty results, and the ``rag`` graph node is a
-no-op that simply passes the (empty) chunk list through.
+Scoping is enforced by the Qdrant payload filter so a release-scoped query never
+recalls another release's documents. Every hop degrades gracefully: if Qdrant or
+SiliconFlow is unreachable the retriever logs and returns ``[]`` (matching the old
+stub), so the agent keeps running; if only rerank fails, results fall back to the
+RRF-fused order.
 """
 import logging
 
@@ -35,33 +18,86 @@ from langchain_core.callbacks import AsyncCallbackManagerForRetrieverRun, Callba
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 
+from app.agent.rag.config import rag_settings
+from app.agent.rag.embed import embedder, reranker, sparse
+from app.agent.rag.storage import qdrant_store
+
 logger = logging.getLogger(__name__)
 
 
-class ReleaseAwareRetriever(BaseRetriever):
-    """
-    A ``BaseRetriever`` bound to a single (release_id, project_id, scope) filter.
+def _point_to_document(point) -> Document:
+    payload = point.payload or {}
+    return Document(
+        page_content=payload.get("content", ""),
+        metadata={
+            "document_id": payload.get("document_id", ""),
+            "chunk_id": payload.get("chunk_id", ""),
+            "source": payload.get("source", ""),
+            "scope": payload.get("scope", ""),
+            "seq": payload.get("seq", 0),
+            "score": float(point.score),
+        },
+    )
 
-    Stub: returns ``[]``. Wire up Qdrant here later — apply the metadata filter
-    described in the module docstring.
-    """
+
+async def _hybrid_search(
+    query: str, *, project_id: int | None, release_id: int | None, scope: str, limit: int
+) -> list[Document]:
+    dense = await embedder.embed_one(query)
+    sp = await sparse.embed_query(query)
+    query_filter = qdrant_store.build_filter(
+        project_id=project_id, release_id=release_id, scope=scope
+    )
+    points = await qdrant_store.hybrid_query(
+        dense=dense, sparse=sp, query_filter=query_filter, limit=limit
+    )
+    return [_point_to_document(p) for p in points]
+
+
+async def _rerank(query: str, docs: list[Document], top_k: int) -> list[Document]:
+    if not docs:
+        return []
+    try:
+        ranked = await reranker.rerank(query, [d.page_content for d in docs], top_n=top_k)
+    except Exception:
+        logger.warning("Rerank unavailable — falling back to fusion order")
+        return docs[:top_k]
+    out: list[Document] = []
+    for idx, score in ranked:
+        doc = docs[idx]
+        doc.metadata["score"] = float(score)
+        out.append(doc)
+    return out
+
+
+class ReleaseAwareRetriever(BaseRetriever):
+    """A ``BaseRetriever`` bound to a single (release_id, project_id, scope) filter."""
 
     release_id: int | None = None
     project_id: int | None = None
-    scope: str = "release"  # "release" | "project"
+    scope: str = "release"
     top_k: int = 5
 
     def _get_relevant_documents(
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun
     ) -> list[Document]:
-        return []
+        raise NotImplementedError("Use the async interface (ainvoke).")
 
     async def _aget_relevant_documents(
         self, query: str, *, run_manager: AsyncCallbackManagerForRetrieverRun
     ) -> list[Document]:
-        # TODO(rag): embed `query`, query Qdrant with the metadata filter for this
-        # release/project scope, return the top_k matches as Documents.
-        return []
+        try:
+            candidates = await _hybrid_search(
+                query,
+                project_id=self.project_id,
+                release_id=self.release_id,
+                scope=self.scope,
+                limit=rag_settings.rag_rerank_top_n,
+            )
+        except Exception:
+            logger.exception("Hybrid retrieval failed (scope=%s) — returning []", self.scope)
+            return []
+        return await _rerank(query, candidates, self.top_k)
 
 
 async def retrieve(
@@ -69,21 +105,26 @@ async def retrieve(
     *,
     release_id: int | None = None,
     project_id: int | None = None,
-    top_k: int = 5,
+    top_k: int | None = None,
 ) -> list[Document]:
     """
-    Convenience helper used by the graph ``rag`` node.
-
-    Recalls both release-scoped and project-scoped documents for the query,
-    metadata-filtered. Currently returns ``[]`` (see module docstring).
+    Union release-scoped + project-scoped hybrid hits, rerank the merged set,
+    return top_k. Used by the graph ``rag`` node and ``project_memory.search``.
     """
-    docs: list[Document] = []
-    if release_id is not None:
-        docs += await ReleaseAwareRetriever(
-            release_id=release_id, project_id=project_id, scope="release", top_k=top_k
-        ).ainvoke(query)
-    if project_id is not None:
-        docs += await ReleaseAwareRetriever(
-            project_id=project_id, scope="project", top_k=top_k
-        ).ainvoke(query)
-    return docs
+    top_k = top_k or rag_settings.rag_top_k
+    candidates: list[Document] = []
+    try:
+        if release_id is not None:
+            candidates += await _hybrid_search(
+                query, project_id=project_id, release_id=release_id,
+                scope="release", limit=rag_settings.rag_rerank_top_n,
+            )
+        if project_id is not None:
+            candidates += await _hybrid_search(
+                query, project_id=project_id, release_id=None,
+                scope="project", limit=rag_settings.rag_rerank_top_n,
+            )
+    except Exception:
+        logger.exception("Hybrid retrieval failed — returning []")
+        return []
+    return await _rerank(query, candidates, top_k)

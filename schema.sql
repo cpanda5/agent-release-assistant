@@ -182,6 +182,78 @@ CREATE TABLE release_context (
     UNIQUE KEY  uk_release_id (release_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- ============ knowledge_base ============
+CREATE TABLE knowledge_base (
+    id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    uuid            VARCHAR(36)     NOT NULL,
+    project_id      BIGINT UNSIGNED NOT NULL,
+    name            VARCHAR(128)    NOT NULL,
+    description     TEXT,
+    embedding_model VARCHAR(64)     NOT NULL DEFAULT 'BAAI/bge-m3',
+    status          TINYINT         NOT NULL DEFAULT 1,          -- 1=active 2=archived
+    created_at      DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at      DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                                    ON UPDATE CURRENT_TIMESTAMP(3),
+    deleted_at      DATETIME(3),
+    PRIMARY KEY (id),
+    UNIQUE KEY  uk_uuid (uuid),
+    UNIQUE KEY  uk_project_id (project_id),                      -- one KB per project
+    KEY         idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ============ document ============
+CREATE TABLE document (
+    id                BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    uuid              VARCHAR(36)     NOT NULL,
+    knowledge_base_id BIGINT UNSIGNED NOT NULL,
+    project_id        BIGINT UNSIGNED NOT NULL,
+    release_id        BIGINT UNSIGNED,                           -- nullable: project-scoped docs
+    scope             VARCHAR(16)     NOT NULL DEFAULT 'project', -- project / release
+    filename          VARCHAR(512)    NOT NULL,
+    mime_type         VARCHAR(128),
+    doc_type          VARCHAR(16)     NOT NULL DEFAULT 'text',    -- text / image / audio
+    minio_bucket      VARCHAR(64),
+    minio_object_key  VARCHAR(512),
+    file_size         BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    file_hash         CHAR(64),                                  -- sha256 hex, for dedup
+    parse_status      VARCHAR(16)     NOT NULL DEFAULT 'pending', -- pending/parsing/parsed/failed
+    parse_error       VARCHAR(1024),
+    chunk_count       INT UNSIGNED    NOT NULL DEFAULT 0,
+    char_count        INT UNSIGNED    NOT NULL DEFAULT 0,
+    created_at        DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at        DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                                      ON UPDATE CURRENT_TIMESTAMP(3),
+    deleted_at        DATETIME(3),
+    PRIMARY KEY (id),
+    UNIQUE KEY  uk_uuid (uuid),
+    KEY         idx_kb_id (knowledge_base_id),
+    KEY         idx_project_release (project_id, release_id),
+    KEY         idx_file_hash (file_hash),
+    KEY         idx_parse_status (parse_status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ============ chunk ============
+CREATE TABLE chunk (
+    id                BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    uuid              VARCHAR(36)     NOT NULL,
+    document_id       BIGINT UNSIGNED NOT NULL,
+    knowledge_base_id BIGINT UNSIGNED NOT NULL,
+    project_id        BIGINT UNSIGNED NOT NULL,
+    release_id        BIGINT UNSIGNED,
+    scope             VARCHAR(16)     NOT NULL DEFAULT 'project',
+    seq               INT UNSIGNED    NOT NULL DEFAULT 0,         -- order within the document
+    content           MEDIUMTEXT      NOT NULL,
+    token_count       INT UNSIGNED    NOT NULL DEFAULT 0,
+    qdrant_point_id   VARCHAR(36)     NOT NULL,                   -- 1:1 with a Qdrant point
+    metadata          JSON,
+    created_at        DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (id),
+    UNIQUE KEY  uk_uuid (uuid),
+    KEY         idx_document_seq (document_id, seq),
+    KEY         idx_qdrant_point (qdrant_point_id),
+    KEY         idx_project_release (project_id, release_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- ============ tool_call_trace ============
 CREATE TABLE tool_call_trace (
     id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,

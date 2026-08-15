@@ -34,8 +34,20 @@ class _RagProjectMemory(ProjectMemory):
         ]
 
     async def ingest(self, content: str, metadata: dict) -> str:
-        # TODO(rag): chunk + embed + upsert into Qdrant with release/project metadata.
-        return ""
+        from app.agent.rag.ingest.pipeline import ingest_document
+
+        project_id = _maybe_int(metadata.get("project_id"))
+        if project_id is None:
+            return ""
+        doc = await ingest_document(
+            file_bytes=content.encode("utf-8"),
+            filename=metadata.get("source", "inline.md"),
+            project_id=project_id,
+            release_id=_maybe_int(metadata.get("release_id")),
+            scope=metadata.get("scope", "project"),
+            mime_type="text/markdown",
+        )
+        return doc.uuid
 
 
 def _maybe_int(value) -> int | None:

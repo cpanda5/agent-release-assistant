@@ -6,8 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Setup (uv required):**
 ```bash
-uv sync
-cp .env.example .env   # then fill in DASHSCOPE_API_KEY and MySQL creds
+uv sync                 # core deps (incl. qdrant-client / minio / fastembed)
+uv sync --extra rag     # optional: heavy parser deps (unstructured/paddleocr/funasr)
+cp .env.example .env     # then fill in DASHSCOPE_API_KEY, SILICONFLOW_API_KEY, MySQL creds
+docker compose up -d qdrant minio   # RAG infra (Qdrant + MinIO)
 ```
 
 **Run dev server:**
@@ -60,7 +62,7 @@ POST /agent/chat/stream (SSE) → llm_gateway.astream()  — single turn, separa
 | `app/agent/llm/tracer.py` | `write_trace()` — async MySQL insert into `llm_trace`; never raises. |
 | `app/agent/tools/` | `BaseTool` + `registry` (`to_langchain_tools()`) + `executor` (retry/confirmation/tool_trace). Impls in `tools/impl/`. |
 | `app/agent/memory/` | 3-layer memory: `working` (in-proc), `release` (MySQL sessions/messages/summary/context), `project` (RAG bridge). `manager.py` orchestrates + token budget + compression. |
-| `app/agent/rag/` | `ReleaseAwareRetriever` (LangChain `BaseRetriever`) — **stub**; Qdrant + metadata filter deferred. |
+| `app/agent/rag/` | Knowledge base: hybrid retrieval (`retriever.py`, dense bge-m3 + BM25 sparse, RRF fusion + bge-reranker), ingestion pipeline (`ingest/`), stores (`storage/` — Qdrant/MinIO/MySQL), embeddings (`embed/`), `/knowledge/*` API (`router.py`). Scoped by `release_id`/`project_id`. See `docs/Architecture/rag.md`. |
 | `app/db.py` | `aiomysql` pool. MySQL is optional — if unset/unreachable, tracing + persistence silently skip. |
 | `app/schemas/agent.py` | Pydantic request/response models; requests carry `model` (validated), `user_id`, `enable_thinking`. |
 | `schema.sql` | DDL for sessions/messages/session_summary/release_context/llm_trace/tool_call_trace. |
@@ -87,6 +89,16 @@ Templates live in `templates/<name>/v1.yaml`. Use `load_template(name, version)`
 
 Sessions carry a `release_id` (and `user_id`): `sessions(session_id, release_id, user_id, created_at)` and `messages(message_id, session_id, role, content, created_at, ...)`. Memory is three-tiered — current session (working memory), current release (session summaries + release_context + release-scoped RAG docs), and project (project-scoped RAG). RAG documents are ingested with `release_id`/`project_id` metadata so retrieval is filtered per release and never leaks across releases.
 
-### Next steps
+### RAG subsystem
 
-RAG is a stub (`ReleaseAwareRetriever` returns `[]`): the Qdrant vector store, DashScope embeddings, and the MD ingestion pipeline (chunk → tag with `release_id` → upsert) are a separate follow-up design.
+Implemented (was previously a stub). Upload → MinIO (original) → parse (Unstructured /
+PaddleOCR PP-Structure / FunASR, by type; heavy deps lazy-imported behind the `[rag]`
+extra) → table-to-text → split → embed (bge-m3 dense + FastEmbed BM25 sparse) → Qdrant
+(one collection, dense + sparse, RRF fusion via Query API) + MySQL (`knowledge_base` /
+`document` / `chunk`). Retrieval is metadata-filtered hybrid → bge-reranker-v2-m3 → top-k,
+every chunk traceable to its document/chunk. Embedding + rerank via **SiliconFlow**.
+Graceful degrade: Qdrant/SiliconFlow unreachable → retrieval returns `[]`; ingestion
+requires MySQL (else 503). Endpoints under `/knowledge/*`. Docs: `docs/Architecture/rag*.md`.
+
+**Follow-ups (out of scope):** redis-backed async ingestion worker; jieba Chinese BM25
+tokenization; incremental re-embedding on model change.

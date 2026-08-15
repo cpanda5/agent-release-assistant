@@ -16,6 +16,24 @@ dependencies = [
     "langchain>=0.3.0",
     "langchain-core>=0.3.0",
     "langchain-openai>=0.2.0",
+    "langchain-text-splitters>=0.3.0",
+    "httpx>=0.27.0",
+    "python-multipart>=0.0.9",
+    "qdrant-client>=1.12.0",
+    "minio>=7.2.0",
+    "fastembed>=0.4.0",
+]
+
+# Heavy ML parser dependencies. Kept OUT of the core install so `uv sync` stays
+# light and works on Windows without a toolchain. Each parser lazy-imports its
+# dep, so a missing one only fails that single file type. Install with:
+#   uv sync --extra rag
+[project.optional-dependencies]
+rag = [
+    "unstructured[all-docs]>=0.15.0",
+    "paddleocr>=2.9.0",
+    "paddlepaddle>=2.6.0",
+    "funasr>=1.1.0",
 ]
 
 [project.scripts]

@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.agent.rag.router import router as knowledge_router
 from app.agent.router import router as agent_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -28,6 +29,9 @@ async def lifespan(app: FastAPI):
     register_all_tools()
     logger.info("Tool registry initialised")
 
+    from app.agent.rag import init_stores
+    await init_stores()
+
     yield
 
     if settings.mysql_host:
@@ -44,6 +48,7 @@ app = FastAPI(
 )
 
 app.include_router(agent_router)
+app.include_router(knowledge_router)
 
 
 @app.get("/")
