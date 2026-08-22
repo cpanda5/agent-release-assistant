@@ -8,9 +8,8 @@ Release-aware hybrid retriever.
 
 Scoping is enforced by the Qdrant payload filter so a release-scoped query never
 recalls another release's documents. Every hop degrades gracefully: if Qdrant or
-SiliconFlow is unreachable the retriever logs and returns ``[]`` (matching the old
-stub), so the agent keeps running; if only rerank fails, results fall back to the
-RRF-fused order.
+SiliconFlow is unreachable the retriever logs and returns ``[]`` so the agent
+keeps running; if only rerank fails, results fall back to the RRF-fused order.
 """
 import logging
 

@@ -8,7 +8,7 @@ Enterprise capabilities are reused, not reimplemented:
   * memory (context assembly + persistence + compression) → ``memory_manager``
   * LLM calls (retry / fallback / tracing)                → ``llm_gateway`` + ``trace_callback``
   * tool execution (retry / confirmation / tool_trace)    → ``tool_executor``
-  * RAG retrieval (release/project metadata filter)       → ``app.agent.rag`` (stub)
+  * RAG retrieval (release/project metadata filter)       → ``app.agent.rag``
 """
 import json
 import logging
@@ -97,7 +97,7 @@ async def planner(state: AgentState) -> dict:
     return {"plan": plan, "messages": [SystemMessage(content=f"[执行规划]\n{plan}")]}
 
 
-# ── rag (stub) ────────────────────────────────────────────────────────── #
+# ── rag ─────────────────────────────────────────────────────────────────── #
 
 async def rag(state: AgentState) -> dict:
     docs = await rag_retrieve(

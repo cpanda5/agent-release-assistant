@@ -1,9 +1,8 @@
 """
 Layer 3: Project Memory — delegates to the RAG retriever.
 
-The actual vector search lives in ``app/agent/rag`` (currently a placeholder).
-AgentContext already has a ``rag_chunks`` field so callers don't change when the
-real Qdrant-backed retriever is implemented.
+The actual vector search lives in ``app/agent/rag`` (Qdrant-backed hybrid
+retrieval). AgentContext carries the results in its ``rag_chunks`` field.
 """
 from app.agent.memory.schemas import KnowledgeChunk
 

@@ -4,14 +4,12 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from app.agent.core import AgentRunner, invoke_agent
+from app.agent.core import invoke_agent
 from app.agent.llm import SYSTEM_PROMPT, llm_gateway
 from app.agent.llm.callbacks import trace_callback
 from app.agent.llm.errors import LLMError
 from app.agent.memory import memory_manager
 from app.schemas.agent import (
-    AgentRunRequest,
-    AgentRunResponse,
     ChatRequest,
     ChatResponse,
     CloseSessionRequest,
@@ -19,19 +17,6 @@ from app.schemas.agent import (
 )
 
 router = APIRouter(prefix="/agent", tags=["agent"])
-_runner = AgentRunner()
-
-
-# ── Legacy endpoint (Phase 1 compat) ─────────────────────────────────────── #
-
-@router.post("/run", response_model=AgentRunResponse)
-async def run_agent(request: AgentRunRequest) -> AgentRunResponse:
-    try:
-        return await _runner.run(request)
-    except LLMError as e:
-        _raise_http(e)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── /agent/chat — sync (full LangGraph workflow) ─────────────────────────── #

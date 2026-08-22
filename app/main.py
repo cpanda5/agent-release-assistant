@@ -18,7 +18,7 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("DASHSCOPE_API_KEY is not set.")
 
     if settings.mysql_host:
-        from app.db import init_db_pool, close_db_pool
+        from app.db import init_db_pool
 
         try:
             await init_db_pool()

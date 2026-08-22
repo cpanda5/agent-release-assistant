@@ -33,7 +33,7 @@ runs standalone.
 ### Request flow
 
 ```
-POST /agent/chat  (or /agent/run legacy)
+POST /agent/chat
   → router.py → core.invoke_agent() → agent_graph.ainvoke()   (LangGraph)
       load_memory → planner → rag → agent ⇄ tools → persist_memory → END
   → each LLM call goes through llm/gateway.py (LLMGateway)
@@ -52,8 +52,8 @@ POST /agent/chat/stream (SSE) → llm_gateway.astream()  — single turn, separa
 |---|---|
 | `app/config.py` | `Settings` + `ALLOWED_MODELS` + `resolve_model()`. Reads `.env`. |
 | `app/main.py` | FastAPI app + lifespan: validates API key, optional MySQL pool, registers tools. |
-| `app/agent/router.py` | Endpoints: `/agent/run` (legacy), `/agent/chat`, `/agent/chat/stream`, `/agent/session/close`, `/agent/health`. |
-| `app/agent/core.py` | `invoke_agent()` / `AgentRunner` — thin adapter that invokes the compiled graph. |
+| `app/agent/router.py` | Endpoints: `/agent/chat`, `/agent/chat/stream`, `/agent/session/close`, `/agent/health`. |
+| `app/agent/core.py` | `invoke_agent()` — thin adapter that invokes the compiled graph. |
 | `app/agent/graph/` | LangGraph workflow: `state.py` (`AgentState`), `nodes.py` (load_memory/planner/rag/agent/tools/persist_memory), `builder.py` (`agent_graph`). |
 | `app/agent/llm/gateway.py` | `LLMGateway` — LangChain `ChatOpenAI` + reused retry/fallback + model selection. `SYSTEM_PROMPT` lives here. |
 | `app/agent/llm/callbacks.py` | `MySQLTraceCallbackHandler` — adapts LangChain callback lifecycle → `llm_trace`. |

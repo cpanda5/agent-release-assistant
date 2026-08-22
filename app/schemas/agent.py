@@ -14,31 +14,13 @@ def _validate_model(value: str | None) -> str | None:
     return value
 
 
-# ── Legacy /agent/run ──────────────────────────────────────────────────────── #
-
-class AgentRunRequest(BaseModel):
-    message: str
-    release_id: str | None = None
-    project_id: str | None = None
-    session_id: str | None = None
-    user_id: str | None = None
-    model: str | None = None
-    enable_thinking: bool | None = None
-
-    _check_model = field_validator("model")(_validate_model)
-
+# ── Shared ─────────────────────────────────────────────────────────────────── #
 
 class UsageInfo(BaseModel):
     input_tokens: int
     output_tokens: int
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
-
-
-class AgentRunResponse(BaseModel):
-    response: str
-    session_id: str
-    usage: UsageInfo
 
 
 # ── /agent/chat (sync + stream) ────────────────────────────────────────────── #

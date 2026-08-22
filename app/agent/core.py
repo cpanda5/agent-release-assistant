@@ -1,5 +1,5 @@
 """
-AgentRunner — thin adapter over the LangGraph workflow.
+invoke_agent — thin adapter over the LangGraph workflow.
 
 The former hand-rolled ReAct loop now lives in ``app/agent/graph`` as a
 ``StateGraph`` (load_memory → planner → rag → agent ⇄ tools → persist_memory).
@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from app.agent.graph import agent_graph
-from app.schemas.agent import AgentRunRequest, AgentRunResponse, UsageInfo
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +27,7 @@ async def invoke_agent(request) -> AgentResult:
     """
     Run the agent graph for any request exposing the standard fields
     (message / session_id / release_id / project_id / user_id / model /
-    enable_thinking). Shared by both the legacy runner and the chat endpoints.
+    enable_thinking).
     """
     session_id = request.session_id or str(uuid4())
     trace_id = str(uuid4())
@@ -52,19 +51,6 @@ async def invoke_agent(request) -> AgentResult:
         trace_id=trace_id,
         usage=final_state.get("usage", {}) or {},
     )
-
-
-class AgentRunner:
-    async def run(self, request: AgentRunRequest) -> AgentRunResponse:
-        result = await invoke_agent(request)
-        return AgentRunResponse(
-            response=result.final_text,
-            session_id=result.session_id,
-            usage=UsageInfo(
-                input_tokens=result.usage.get("input_tokens", 0),
-                output_tokens=result.usage.get("output_tokens", 0),
-            ),
-        )
 
 
 def _to_int(value) -> int | None:
