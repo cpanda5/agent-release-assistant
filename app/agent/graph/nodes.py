@@ -5,10 +5,14 @@ Each node returns a partial state update. The ``messages`` field uses the
 ``add_messages`` reducer, so nodes append by returning a list of new messages.
 
 Enterprise capabilities are reused, not reimplemented:
-  * memory (context assembly + persistence + compression) → ``memory_manager``
+  * memory (context load + turn persistence + summarization) → ``memory_manager``
   * LLM calls (retry / fallback / tracing)                → ``llm_gateway`` + ``trace_callback``
   * tool execution (retry / confirmation / tool_trace)    → ``tool_executor``
   * RAG retrieval (release/project metadata filter)       → ``app.agent.rag``
+
+Memory reads happen only in ``load_memory``; writes only in ``persist_memory``
+(user turn + final answer → ``message`` table, plus a background summary check).
+Intermediate tool turns are not replayed — ``tool_call_trace`` records them.
 """
 import json
 import logging
@@ -48,30 +52,18 @@ def _run_metadata(state: AgentState) -> dict:
 # ── load_memory ───────────────────────────────────────────────────────── #
 
 async def load_memory(state: AgentState) -> dict:
-    session_id = state["session_id"]
-    release_id = state.get("release_id")
-    project_id = state.get("project_id")
-    user_query = state["user_query"]
-
-    # Register the session (sessions table) and assemble prior context.
+    # Register the session, then read all four context layers (project /
+    # release / session summary / history) into the prompt + message list.
     await memory_manager.ensure_session(
-        session_id=session_id, release_id=release_id, user_id=state.get("user_id")
+        session_id=state["session_id"],
+        release_id=state.get("release_id"),
+        user_id=state.get("user_id"),
     )
     ctx = await memory_manager.build_context(
-        session_id=session_id,
-        release_id=release_id,
-        project_id=project_id,
-        user_query=user_query,
+        session_id=state["session_id"],
+        release_id=state.get("release_id"),
+        project_id=state.get("project_id"),
     )
-    # Persist the incoming user turn to working memory + MySQL.
-    await memory_manager.append_message(
-        session_id=session_id,
-        role="user",
-        content=user_query,
-        release_id=release_id,
-        project_id=project_id,
-    )
-
     return {"messages": _ctx_to_messages(ctx), "iteration": 0, "usage": {}}
 
 
@@ -131,17 +123,6 @@ async def agent(state: AgentState) -> dict:
     )
 
     usage = ai.usage_metadata or {}
-    oai_tool_calls = _lc_tool_calls_to_oai(ai.tool_calls)
-    await memory_manager.append_message(
-        session_id=state["session_id"],
-        role="assistant",
-        content=ai.text or None,
-        tool_calls=oai_tool_calls or None,
-        token_count=usage.get("output_tokens", 0),
-        trace_id=state.get("trace_id"),
-        release_id=state.get("release_id"),
-        project_id=state.get("project_id"),
-    )
     return {
         "messages": [ai],
         "usage": {
@@ -170,14 +151,6 @@ async def tools(state: AgentState) -> dict:
 
     tool_msgs: list = []
     for r in results:
-        await memory_manager.append_message(
-            session_id=state["session_id"],
-            role="tool",
-            content=r["content"],
-            tool_call_id=r.get("tool_call_id"),
-            release_id=state.get("release_id"),
-            project_id=state.get("project_id"),
-        )
         tool_msgs.append(ToolMessage(content=r["content"], tool_call_id=r["tool_call_id"]))
 
     logger.info(
@@ -190,8 +163,6 @@ async def tools(state: AgentState) -> dict:
 # ── persist_memory (finalize) ─────────────────────────────────────────── #
 
 async def persist_memory(state: AgentState) -> dict:
-    # Per-turn writes already happened in load_memory / agent / tools; here we
-    # just surface the final answer for the response.
     final_text = ""
     for msg in reversed(state["messages"]):
         if isinstance(msg, AIMessage) and msg.text.strip():
@@ -199,6 +170,16 @@ async def persist_memory(state: AgentState) -> dict:
             break
     if not final_text and state.get("iteration", 0) >= MAX_TOOL_ITERATIONS:
         final_text = "Agent 已达到最大工具调用迭代次数，无法继续处理请求。"
+
+    # Single write point: user turn + final answer → `message`, then a
+    # background check whether the session needs a new summary version.
+    await memory_manager.persist_turn(
+        session_id=state["session_id"],
+        release_id=state.get("release_id"),
+        user_query=state["user_query"],
+        final_text=final_text,
+        trace_id=state.get("trace_id"),
+    )
     return {"final_text": final_text}
 
 
@@ -218,20 +199,13 @@ def route_after_agent(state: AgentState) -> str:
 # ── Helpers ───────────────────────────────────────────────────────────── #
 
 def _ctx_to_messages(ctx: AgentContext) -> list:
-    """
-    Convert assembled memory (system prompt + prior turns) into LangChain
-    messages. Intermediate tool-calling turns from history are collapsed — only
-    user turns and final assistant answers are replayed — which avoids the
-    tool_call/tool_result pairing constraint across turns while preserving the
-    conversation thread.
-    """
+    """Convert assembled memory into LangChain messages (system prompt + replay)."""
     out: list = [SystemMessage(content=ctx.system_prompt)]
     for m in ctx.messages:
         if m.role == "user":
             out.append(HumanMessage(content=m.content or ""))
-        elif m.role == "assistant" and m.content and not m.tool_calls:
-            out.append(AIMessage(content=m.content))
-        # tool results and tool-call-only assistant turns are skipped in replay
+        elif m.role == "assistant":
+            out.append(AIMessage(content=m.content or ""))
     return out
 
 
@@ -245,9 +219,3 @@ def _lc_tool_call_to_oai(tc: dict) -> dict:
             "arguments": json.dumps(tc.get("args", {}), ensure_ascii=False),
         },
     }
-
-
-def _lc_tool_calls_to_oai(tool_calls: list | None) -> list[dict]:
-    if not tool_calls:
-        return []
-    return [_lc_tool_call_to_oai(tc) for tc in tool_calls]

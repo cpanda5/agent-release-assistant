@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     mysql_password: str = ""
     mysql_db: str = "agent_release"
 
+    # Auth (login / register / Bearer token)
+    auth_secret_key: str = "dev-secret-change-me"
+    token_expire_hours: int = 72
+
     def resolve_model(self, name: str | None) -> str:
         """Validate a requested model name, falling back to the default."""
         if name and name in ALLOWED_MODELS:

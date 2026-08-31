@@ -1,59 +1,61 @@
 """
-Layer 3: Project Memory — delegates to the RAG retriever.
-
-The actual vector search lives in ``app/agent/rag`` (Qdrant-backed hybrid
-retrieval). AgentContext carries the results in its ``rag_chunks`` field.
+Project memory layer — stable background from the `project` table
+(context_summary / tech_constraints). Read-only for the agent; maintained via
+admin channels. RAG retrieval lives in the graph's `rag` node, not here.
 """
-from app.agent.memory.schemas import KnowledgeChunk
+import json
+import logging
+
+from app.db import get_db_pool
+
+logger = logging.getLogger(__name__)
 
 
-class ProjectMemory:
-    async def search(self, query: str, project_id: str) -> list[KnowledgeChunk]:
-        raise NotImplementedError
-
-    async def ingest(self, content: str, metadata: dict) -> str:
-        raise NotImplementedError
-
-
-class _RagProjectMemory(ProjectMemory):
-    """Bridges the legacy KnowledgeChunk API onto the LangChain retriever."""
-
-    async def search(self, query: str, project_id: str) -> list[KnowledgeChunk]:
-        from app.agent.rag import retrieve
-
-        pid = _maybe_int(project_id)
-        docs = await retrieve(query, project_id=pid)
-        return [
-            KnowledgeChunk(
-                content=d.page_content,
-                source=str(d.metadata.get("source", "")),
-                score=float(d.metadata.get("score", 0.0)),
-            )
-            for d in docs
-        ]
-
-    async def ingest(self, content: str, metadata: dict) -> str:
-        from app.agent.rag.ingest.pipeline import ingest_document
-
-        project_id = _maybe_int(metadata.get("project_id"))
-        if project_id is None:
-            return ""
-        doc = await ingest_document(
-            file_bytes=content.encode("utf-8"),
-            filename=metadata.get("source", "inline.md"),
-            project_id=project_id,
-            release_id=_maybe_int(metadata.get("release_id")),
-            scope=metadata.get("scope", "project"),
-            mime_type="text/markdown",
-        )
-        return doc.uuid
-
-
-def _maybe_int(value) -> int | None:
+async def load_project_context(project_id: int) -> dict | None:
+    pool = get_db_pool()
+    if pool is None:
+        return None
     try:
-        return int(value)
-    except (ValueError, TypeError):
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT context_summary, tech_constraints FROM project "
+                    "WHERE id = %s AND status = 1 AND deleted_at IS NULL",
+                    (project_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    return None
+                return {
+                    "context_summary": row[0] or "",
+                    "tech_constraints": _json_load(row[1]),
+                }
+    except Exception:
+        logger.exception("Failed to load project context for project_id=%s", project_id)
         return None
 
 
-project_memory = _RagProjectMemory()
+def build_project_prompt_block(ctx: dict | None) -> str:
+    if not ctx or not (ctx.get("context_summary") or ctx.get("tech_constraints")):
+        return ""
+    lines = ["--- Project 上下文 ---"]
+    if ctx.get("context_summary"):
+        lines.append(ctx["context_summary"])
+    constraints = ctx.get("tech_constraints") or []
+    if constraints:
+        lines.append("\n技术约束：")
+        lines += [f"  • {c}" for c in constraints]
+    lines.append("--- End ---")
+    return "\n".join(lines)
+
+
+def _json_load(value) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        return []

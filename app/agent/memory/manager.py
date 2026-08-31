@@ -1,10 +1,21 @@
 """
-MemoryManager — the only class AgentCore imports from this package.
+MemoryManager — the only class the graph imports from this package.
 
-Three public methods:
-  build_context()   — assemble AgentContext before each LLM call
-  append_message()  — record one turn (user or assistant)
-  close_session()   — summarise and persist when session ends
+Four MySQL-backed context layers (no in-process memory state):
+
+  Project Context  — stable background / tech stack (`project` table, read-only)
+  Release Context  — release progress & todos (`release_context`)
+  Session Summary  — versioned compression of older messages (`session_summary`)
+  Session History  — raw messages, source of truth (`message`)
+
+Reads happen once per turn in `load_memory` (build_context); writes happen once
+in `persist_memory` (persist_turn). Session summaries are produced by a
+background task when unsummarized history exceeds a threshold, and finalized
+by close_session (which also merges progress into release_context).
+
+The summary watermark is temporal: each summary row's `created_at` is the
+cutoff up to which messages are covered; replay loads messages newer than the
+latest cutoff (see release.py).
 """
 import asyncio
 import logging
@@ -12,141 +23,38 @@ import logging
 from app.agent.llm.gateway import SYSTEM_PROMPT, llm_gateway
 from app.agent.memory import project as _proj_layer
 from app.agent.memory import release as _rel_layer
-from app.agent.memory import working as _work_layer
 from app.agent.memory.schemas import AgentContext, Message
 from app.agent.memory.tokens import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
-# Token budget slices (see Module 2 spec §7)
-_TOTAL_BUDGET = 100_000
+# Token caps for the injected prompt blocks
+_PROJECT_CTX_MAX = 1_000
 _RELEASE_CTX_MAX = 2_000
-_PROJECT_RAG_MAX = 3_000
-_COMPLETION_RESERVE = 5_000
+_SUMMARY_MAX = 2_000
+# History replay window
+_HISTORY_LIMIT = 50
+_HISTORY_TOKEN_MAX = 8_000
+# Summarize when unsummarized history exceeds either threshold
+_SUMMARY_TRIGGER_MESSAGES = 40
+_SUMMARY_TRIGGER_TOKENS = 8_000
+# Hard cap on LLM input when generating a summary
+_SUMMARY_INPUT_CHARS = 12_000
+
+# Strong refs to background tasks (asyncio only keeps weak refs)
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_bg(coro) -> None:
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
 
 class MemoryManager:
 
     # ------------------------------------------------------------------ #
-    # build_context                                                        #
-    # ------------------------------------------------------------------ #
-
-    async def build_context(
-        self,
-        *,
-        session_id: str,
-        release_id: int | None,
-        project_id: int | None,
-        user_query: str,
-    ) -> AgentContext:
-        """
-        Concurrently reads all three memory layers and assembles AgentContext.
-        Token budget is enforced in priority order (spec §7).
-        """
-        wm = _work_layer.get_or_create(session_id)
-
-        # Parallel I/O: release context + project RAG
-        release_ctx_task = asyncio.create_task(
-            _rel_layer.load_release_context(release_id) if release_id else _noop_task(None)
-        )
-        rag_task = asyncio.create_task(
-            _proj_layer.project_memory.search(user_query, str(project_id))
-            if project_id else _noop_task([])
-        )
-        release_ctx, rag_chunks = await asyncio.gather(release_ctx_task, rag_task)
-
-        # ── Build system prompt ──────────────────────────────────────── #
-        system_parts = [SYSTEM_PROMPT]
-
-        summary_preamble = wm.combined_summary()
-        if summary_preamble:
-            system_parts.append(f"\n\n--- 本 session 早期对话摘要 ---\n{summary_preamble}\n---")
-
-        release_block = _rel_layer.build_release_prompt_block(release_ctx)
-        if release_block:
-            release_block = _truncate_to_tokens(release_block, _RELEASE_CTX_MAX)
-            system_parts.append(f"\n\n{release_block}")
-
-        system_prompt = "".join(system_parts)
-
-        # ── Compute remaining budget ─────────────────────────────────── #
-        budget = _TOTAL_BUDGET
-        budget -= estimate_tokens(system_prompt)
-        budget -= estimate_tokens(user_query)
-        budget -= _COMPLETION_RESERVE
-        for chunk in rag_chunks:
-            budget -= estimate_tokens(chunk.content)
-        budget = max(budget, 0)
-
-        # ── Select working-memory messages within budget ─────────────── #
-        live_msgs = _select_messages_within_budget(wm, budget)
-
-        ctx = AgentContext(
-            system_prompt=system_prompt,
-            messages=live_msgs,
-            rag_chunks=rag_chunks,
-            estimated_tokens=_TOTAL_BUDGET - budget,
-        )
-
-        # Trigger compression if working memory is growing large
-        if wm.needs_compression():
-            asyncio.create_task(self._compress(wm))
-
-        return ctx
-
-    # ------------------------------------------------------------------ #
-    # append_message                                                       #
-    # ------------------------------------------------------------------ #
-
-    async def append_message(
-        self,
-        *,
-        session_id: str,
-        role: str,
-        content: str | None = None,
-        token_count: int = 0,
-        trace_id: str | None = None,
-        release_id: int | None = None,
-        project_id: int | None = None,
-        tool_calls: list[dict] | None = None,
-        tool_call_id: str | None = None,
-    ) -> None:
-        """
-        1. Append to in-process WorkingMemory.
-        2. Persist to MySQL message table (fire-and-forget).
-        """
-        import json as _json
-        wm = _work_layer.get_or_create(session_id)
-        persist_content = content or ""
-        if tool_calls and not content:
-            persist_content = _json.dumps(tool_calls, ensure_ascii=False)
-        if token_count == 0:
-            token_count = estimate_tokens(persist_content)
-        wm.append(role, content, trace_id, tool_calls=tool_calls, tool_call_id=tool_call_id)
-
-        # content_type mirrors the `message` table enum (text / tool_call / tool_result)
-        if role == "tool":
-            content_type = "tool_result"
-        elif tool_calls:
-            content_type = "tool_call"
-        else:
-            content_type = "text"
-
-        # Persist without blocking the response path
-        asyncio.create_task(
-            _rel_layer.persist_message(
-                session_id=session_id,
-                role=role,
-                content=persist_content,
-                token_count=token_count,
-                trace_id=trace_id,
-                content_type=content_type,
-                tool_call_id=tool_call_id,
-            )
-        )
-
-    # ------------------------------------------------------------------ #
-    # ensure_session                                                       #
+    # session                                                              #
     # ------------------------------------------------------------------ #
 
     async def ensure_session(
@@ -156,14 +64,75 @@ class MemoryManager:
         release_id: int | None = None,
         user_id: str | None = None,
     ) -> int | None:
-        """Register the session row and return its BIGINT id (cached for writers)."""
+        """Register the session row and return its BIGINT id."""
         return await _rel_layer.ensure_session(
             session_id=session_id, release_id=release_id, user_id=user_id
         )
 
     # ------------------------------------------------------------------ #
-    # update_release_context_with_artifact                                 #
+    # read path — load_memory node                                         #
     # ------------------------------------------------------------------ #
+
+    async def build_context(
+        self,
+        *,
+        session_id: str,
+        release_id: int | None,
+        project_id: int | None,
+    ) -> AgentContext:
+        """Read all four layers and assemble system prompt + replay history."""
+        project_ctx, release_ctx, summary = await asyncio.gather(
+            _proj_layer.load_project_context(project_id) if project_id else _noop(None),
+            _rel_layer.load_release_context(release_id) if release_id else _noop(None),
+            _rel_layer.load_latest_summary(session_id),
+        )
+
+        cutoff = summary["cutoff"] if summary else None
+        history = await _rel_layer.load_history(session_id, after=cutoff, limit=_HISTORY_LIMIT)
+
+        system_parts = [SYSTEM_PROMPT]
+        for block, cap in (
+            (_proj_layer.build_project_prompt_block(project_ctx), _PROJECT_CTX_MAX),
+            (_rel_layer.build_release_prompt_block(release_ctx), _RELEASE_CTX_MAX),
+            (_rel_layer.build_summary_prompt_block(summary), _SUMMARY_MAX),
+        ):
+            if block:
+                system_parts.append("\n\n" + _truncate_tail(block, cap))
+
+        system_prompt = "".join(system_parts)
+        messages = _select_messages_within_budget(history, _HISTORY_TOKEN_MAX)
+        used = sum(m.token_count or estimate_tokens(m.content) for m in messages)
+        return AgentContext(
+            system_prompt=system_prompt,
+            messages=messages,
+            estimated_tokens=estimate_tokens(system_prompt) + used,
+        )
+
+    # ------------------------------------------------------------------ #
+    # write path — persist_memory node                                     #
+    # ------------------------------------------------------------------ #
+
+    async def persist_turn(
+        self,
+        *,
+        session_id: str,
+        release_id: int | None,
+        user_query: str,
+        final_text: str,
+        trace_id: str | None = None,
+    ) -> None:
+        """Persist this turn (user + final assistant), then check the summary threshold."""
+        await _rel_layer.insert_message(
+            session_id=session_id, role="user", content=user_query,
+            token_count=estimate_tokens(user_query),
+        )
+        if final_text:
+            await _rel_layer.insert_message(
+                session_id=session_id, role="assistant", content=final_text,
+                token_count=estimate_tokens(final_text), trace_id=trace_id,
+            )
+        if release_id is not None:  # session_summary.release_id is NOT NULL
+            _spawn_bg(self._maybe_summarize(session_id, release_id))
 
     async def update_release_context_with_artifact(
         self,
@@ -172,27 +141,24 @@ class MemoryManager:
         session_id: str,
         artifact: dict,
     ) -> None:
-        """
-        Called by GenerateArtifactTool after a successful artifact creation.
-        Appends an artifact mention to the release progress summary so future
-        sessions know what has already been produced.
-        """
+        """Called by GenerateArtifactTool; appends an artifact note to the progress summary."""
         existing = await _rel_layer.load_release_context(release_id) or {}
-        artifact_note = f"[交付物] {artifact.get('type', '')}：{artifact.get('title', '')} (id={artifact.get('artifact_id', '')})"
-        prev_summary = existing.get("progress_summary", "")
-        new_summary = (prev_summary + "\n" + artifact_note).strip() if prev_summary else artifact_note
-        new_summary = _truncate_to_tokens(new_summary, _RELEASE_CTX_MAX)
+        note = (
+            f"[交付物] {artifact.get('type', '')}：{artifact.get('title', '')} "
+            f"(id={artifact.get('artifact_id', '')})"
+        )
+        prev = existing.get("progress_summary", "")
+        progress = (prev + "\n" + note).strip() if prev else note
         await _rel_layer.upsert_release_context(
             release_id=release_id,
-            progress_summary=new_summary,
-            key_decisions=existing.get("key_decisions"),
+            progress_summary=_truncate_head(progress, _RELEASE_CTX_MAX),
             pending_tasks=existing.get("pending_tasks"),
             tech_constraints=existing.get("tech_constraints"),
-            last_updated_by=session_id,
+            updated_by=session_id,
         )
 
     # ------------------------------------------------------------------ #
-    # close_session                                                        #
+    # session close                                                        #
     # ------------------------------------------------------------------ #
 
     async def close_session(
@@ -201,47 +167,87 @@ class MemoryManager:
         session_id: str,
         release_id: int | None = None,
     ) -> None:
-        """
-        Generate a final session summary → write session_summary →
-        update release_context.
-        """
-        wm = _work_layer.get(session_id)
-        if wm is None:
+        """Final summary → session_summary, then merge progress into release_context."""
+        if release_id is None:
+            logger.warning("close_session without release_id: summary skipped (session=%s)", session_id)
             return
-
-        full_text = wm.full_text_for_final_summary()
-        if not full_text.strip():
-            _work_layer.evict(session_id)
+        prev = await _rel_layer.load_latest_summary(session_id)
+        cutoff, pending = await self._read_unsummarized(session_id, prev)
+        if not pending:
             return
-
-        summary, key_decisions = await _generate_session_summary(full_text)
-        token_count = estimate_tokens(summary)
-
-        if release_id:
-            await _rel_layer.write_session_summary(
-                session_id=session_id,
-                release_id=release_id,
-                summary=summary,
-                key_decisions=key_decisions,
-                token_count=token_count,
-            )
-            await _update_release_context(release_id, summary, key_decisions, session_id)
-
-        _work_layer.evict(session_id)
-        logger.info("session=%s closed, summary written (%d tokens)", session_id, token_count)
+        summary, decisions = await self._write_summary(session_id, release_id, prev, cutoff, pending)
+        if summary is None:
+            return
+        await self._merge_into_release_context(release_id, summary, decisions, session_id)
+        logger.info("session=%s closed, final summary written", session_id)
 
     # ------------------------------------------------------------------ #
-    # Internal helpers                                                     #
+    # summarization internals                                              #
     # ------------------------------------------------------------------ #
 
-    async def _compress(self, wm: _work_layer.WorkingMemory) -> None:
-        """Background task: summarise overflow and apply compression."""
-        overflow = wm.get_overflow_messages()
-        if not overflow:
-            return
-        text = "\n".join(f"[{m.role}]: {m.content}" for m in overflow)
-        summary, _ = await _generate_session_summary(text)
-        wm.apply_compression(summary)
+    async def _maybe_summarize(self, session_id: str, release_id: int) -> None:
+        """Background: summarize once unsummarized history exceeds a threshold."""
+        try:
+            prev = await _rel_layer.load_latest_summary(session_id)
+            cutoff, pending = await self._read_unsummarized(session_id, prev)
+            tokens = sum(m.token_count or estimate_tokens(m.content) for m in pending)
+            if len(pending) < _SUMMARY_TRIGGER_MESSAGES and tokens < _SUMMARY_TRIGGER_TOKENS:
+                return
+            await self._write_summary(session_id, release_id, prev, cutoff, pending)
+        except Exception:
+            logger.exception("Background summarization failed for session=%s", session_id)
+
+    async def _read_unsummarized(self, session_id: str, prev: dict | None):
+        """
+        Return (cutoff, messages since the previous summary).
+
+        The cutoff is DB NOW(3) captured *before* the read: messages written
+        while the summary LLM call runs land after the cutoff and are replayed
+        verbatim next turn. Worst case a message is both summarized and
+        replayed — harmless duplication, never a gap.
+        """
+        cutoff = await _rel_layer.db_now()
+        after = prev["cutoff"] if prev else None
+        pending = await _rel_layer.load_history(session_id, after=after, limit=500)
+        return cutoff, pending
+
+    async def _write_summary(self, session_id, release_id, prev, cutoff, pending):
+        """Incremental summary: LLM(prev summary + new messages) → new version row."""
+        if not pending:
+            return None, []
+        summary, decisions = await _generate_summary(
+            _serialize_history(pending),
+            prev["summary"] if prev else "",
+        )
+        version = (prev["version"] + 1) if prev else 1
+        await _rel_layer.write_session_summary(
+            session_id=session_id,
+            release_id=release_id,
+            summary=summary,
+            key_decisions=decisions,
+            token_count=estimate_tokens(summary),
+            version=version,
+            cutoff=cutoff,
+        )
+        return summary, decisions
+
+    async def _merge_into_release_context(
+        self, release_id: int, summary: str, decisions: list[str], session_id: str
+    ) -> None:
+        """Fold the session's outcome into the release-level progress summary."""
+        existing = await _rel_layer.load_release_context(release_id) or {}
+        merged = summary
+        if decisions:
+            merged += "\n关键决策：" + "；".join(decisions)
+        prev = existing.get("progress_summary", "")
+        combined = (prev + "\n\n" + merged).strip() if prev else merged
+        await _rel_layer.upsert_release_context(
+            release_id=release_id,
+            progress_summary=_truncate_head(combined, _RELEASE_CTX_MAX),
+            pending_tasks=existing.get("pending_tasks"),
+            tech_constraints=existing.get("tech_constraints"),
+            updated_by=session_id,
+        )
 
 
 # ── Module-level singleton ─────────────────────────────────────────── #
@@ -249,84 +255,67 @@ class MemoryManager:
 memory_manager = MemoryManager()
 
 
-# ── Private helpers ───────────────────────────────────────────────── #
+# ── Helpers ───────────────────────────────────────────────────────── #
 
-async def _noop_task(value):
+async def _noop(value):
     return value
 
 
-def _truncate_to_tokens(text: str, max_tokens: int) -> str:
+def _serialize_history(messages: list[Message]) -> str:
+    lines = [f"[{m.role}]: {m.content}" for m in messages]
+    return "\n".join(lines)[:_SUMMARY_INPUT_CHARS]
+
+
+def _truncate_tail(text: str, max_tokens: int) -> str:
+    """Keep the head, shave the tail — for prompt blocks."""
     if estimate_tokens(text) <= max_tokens:
         return text
-    # Rough truncation: shave characters until within budget
-    while estimate_tokens(text) > max_tokens and len(text) > 0:
+    while estimate_tokens(text) > max_tokens and text:
         text = text[: int(len(text) * 0.9)]
     return text + "\n[截断]"
 
 
-def _select_messages_within_budget(
-    wm: _work_layer.WorkingMemory, token_budget: int
-) -> list[Message]:
-    """
-    Priority: newest messages first, include as many as budget allows.
-    Always include at least the most recent message.
-    """
-    msgs = wm.messages
-    if not msgs:
-        return []
+def _truncate_head(text: str, max_tokens: int) -> str:
+    """Keep the recent tail, shave the head — for append-only progress summaries."""
+    if estimate_tokens(text) <= max_tokens:
+        return text
+    while estimate_tokens(text) > max_tokens and text:
+        text = text[int(len(text) * 0.1):]
+    return "[早期内容已截断]\n" + text
 
+
+def _select_messages_within_budget(
+    messages: list[Message], token_budget: int
+) -> list[Message]:
+    """Newest first; always keep the most recent message."""
     selected: list[Message] = []
     used = 0
-    for msg in reversed(msgs):
+    for msg in reversed(messages):
         cost = msg.token_count or estimate_tokens(msg.content)
         if used + cost > token_budget and selected:
             break
         selected.insert(0, msg)
         used += cost
-
     return selected
 
 
-async def _generate_session_summary(text: str) -> tuple[str, list[str]]:
-    """Call LLM to produce a brief summary + key decisions list."""
+async def _generate_summary(text: str, prev_summary: str = "") -> tuple[str, list[str]]:
+    """LLM-compress a conversation slice; merges with the previous summary if given."""
     prompt = (
         "请对以下对话历史进行简洁总结（不超过300字），并以JSON格式返回：\n"
-        '{"summary": "...", "key_decisions": ["决策1", "决策2"]}\n\n'
-        f"对话历史：\n{text[:8000]}"  # hard cap to avoid runaway costs
+        '{"summary": "...", "key_decisions": ["决策1", "决策2"]}\n'
     )
+    if prev_summary:
+        prompt += f"\n已有摘要（请增量合并，保留仍然有效的信息）：\n{prev_summary}\n"
+    prompt += f"\n对话历史：\n{text}"
     try:
         import json as _json
         ai = await llm_gateway.ainvoke([{"role": "user", "content": prompt}])
-        text_out = ai.text
-        # Try to parse structured output; fall back to raw text
-        start = text_out.find("{")
-        end = text_out.rfind("}") + 1
+        out = ai.text or ""
+        start, end = out.find("{"), out.rfind("}") + 1
         if start != -1 and end > start:
-            data = _json.loads(text_out[start:end])
-            return data.get("summary", text_out), data.get("key_decisions", [])
+            data = _json.loads(out[start:end])
+            return data.get("summary", out), data.get("key_decisions", [])
     except Exception:
         logger.exception("Session summary generation failed")
     return text[:500], []
-
-
-async def _update_release_context(
-    release_id: int,
-    new_summary: str,
-    new_decisions: list[str],
-    session_id: str,
-) -> None:
-    existing = await _rel_layer.load_release_context(release_id) or {}
-    prev_summary = existing.get("progress_summary", "")
-    all_decisions = list(dict.fromkeys(
-        (existing.get("key_decisions") or []) + new_decisions
-    ))
-    combined_summary = (prev_summary + "\n\n" + new_summary).strip() if prev_summary else new_summary
-    combined_summary = _truncate_to_tokens(combined_summary, _RELEASE_CTX_MAX)
-    await _rel_layer.upsert_release_context(
-        release_id=release_id,
-        progress_summary=combined_summary,
-        key_decisions=all_decisions,
-        pending_tasks=existing.get("pending_tasks"),
-        tech_constraints=existing.get("tech_constraints"),
-        last_updated_by=session_id,
-    )

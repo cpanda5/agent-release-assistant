@@ -108,7 +108,7 @@ async def retrieve(
 ) -> list[Document]:
     """
     Union release-scoped + project-scoped hybrid hits, rerank the merged set,
-    return top_k. Used by the graph ``rag`` node and ``project_memory.search``.
+    return top_k. Used by the graph ``rag`` node.
     """
     top_k = top_k or rag_settings.rag_top_k
     candidates: list[Document] = []

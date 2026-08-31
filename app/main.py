@@ -2,9 +2,12 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.agent.rag.router import router as knowledge_router
 from app.agent.router import router as agent_router
+from app.auth import auth_router
+from app.project import project_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -47,6 +50,17 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Dev-friendly CORS so the Vite frontend can call the API directly.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth_router)
+app.include_router(project_router)
 app.include_router(agent_router)
 app.include_router(knowledge_router)
 

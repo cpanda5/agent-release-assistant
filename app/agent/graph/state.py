@@ -11,8 +11,8 @@ class AgentState(TypedDict, total=False):
         load_memory → planner → rag → agent ⇄ tools → persist_memory → END
 
     ``messages`` uses the ``add_messages`` reducer so each node returns only the
-    messages it wants to append. Memory persistence (MySQL + working memory) is
-    handled out-of-band by ``memory_manager`` inside the nodes.
+    messages it wants to append. Memory is read once in ``load_memory`` and
+    written once in ``persist_memory`` (MySQL) via ``memory_manager``.
     """
     messages: Annotated[list[AnyMessage], add_messages]
 
