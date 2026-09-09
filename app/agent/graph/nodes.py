@@ -1,14 +1,8 @@
 """
 LangGraph node functions for the agent workflow.
 
-Each node returns a partial state update. The ``messages`` field uses the
+Each node returns a partial state update; ``messages`` uses the
 ``add_messages`` reducer, so nodes append by returning a list of new messages.
-
-Enterprise capabilities are reused, not reimplemented:
-  * memory (context load + turn persistence + summarization) → ``memory_manager``
-  * LLM calls (retry / fallback / tracing)                → ``llm_gateway`` + ``trace_callback``
-  * tool execution (retry / confirmation / tool_trace)    → ``tool_executor``
-  * RAG retrieval (release/project metadata filter)       → ``app.agent.rag``
 
 Memory reads happen only in ``load_memory``; writes only in ``persist_memory``
 (user turn + final answer → ``message`` table, plus a background summary check).
@@ -18,10 +12,12 @@ import json
 import logging
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from pydantic import BaseModel, Field
 
 from app.agent.graph.state import AgentState
 from app.agent.llm import llm_gateway
 from app.agent.llm.callbacks import trace_callback
+from app.agent.llm.prompt import load_template
 from app.agent.memory import memory_manager
 from app.agent.memory.schemas import AgentContext
 from app.agent.rag import retrieve as rag_retrieve
@@ -33,12 +29,6 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 10
 
-PLANNER_SYSTEM = (
-    "你是研发交付流程的规划器。判断用户请求属于哪个 SDLC 阶段"
-    "（需求分析 / 技术设计 / 代码生成 / 代码Review / GitHub操作 / 其他），"
-    "并用一到两句话给出简短执行计划。只输出：阶段 + 简短计划，不要展开。"
-)
-
 
 def _run_metadata(state: AgentState) -> dict:
     return {
@@ -47,6 +37,18 @@ def _run_metadata(state: AgentState) -> dict:
         "project_id": state.get("project_id"),
         "trace_id": state.get("trace_id", ""),
     }
+
+
+class Plan(BaseModel):
+    """Structured planner output — the SDLC stage + short execution plan."""
+
+    class Stage(str):
+        pass
+
+    stage: str = Field(
+        description="SDLC 阶段：需求分析 / 技术设计 / 代码生成 / 代码Review / GitHub操作 / 其他"
+    )
+    description: str = Field(description="一到两句话的简短执行计划")
 
 
 # ── load_memory ───────────────────────────────────────────────────────── #
@@ -59,34 +61,69 @@ async def load_memory(state: AgentState) -> dict:
         release_id=state.get("release_id"),
         user_id=state.get("user_id"),
     )
+
+    # Render the template's system portion now and pass it as an override.
+    # Placeholders that depend on RAG (rag_context) are filled later, in the rag node.
+    system_override: str | None = None
+    if state.get("prompt_template"):
+        try:
+            tpl = load_template(
+                state["prompt_template"],
+                state.get("prompt_template_version") or "v1",
+            )
+            system_override = tpl.render_system(
+                user_input=state.get("user_query", ""),
+                project_description="",
+                release_name="",
+                tech_stack="",
+            )
+        except FileNotFoundError:
+            logger.warning(
+                "prompt_template '%s' not found; falling back to default",
+                state.get("prompt_template"),
+            )
+
     ctx = await memory_manager.build_context(
         session_id=state["session_id"],
         release_id=state.get("release_id"),
         project_id=state.get("project_id"),
+        system_prompt_override=system_override,
     )
     return {"messages": _ctx_to_messages(ctx), "iteration": 0, "usage": {}}
 
 
-# ── planner (simple) ──────────────────────────────────────────────────── #
+# ── planner (structured output) ───────────────────────────────────────── #
 
 async def planner(state: AgentState) -> dict:
-    prompt = [SystemMessage(content=PLANNER_SYSTEM), HumanMessage(content=state["user_query"])]
+    """
+    Run the planner via LLM structured output. The result is written directly
+    to ``state["plan"]`` for downstream observability; it is not injected into
+    the conversation as a SystemMessage.
+    """
+    prompt = [
+        SystemMessage(
+            content=(
+                "你是研发交付流程的规划器。判断用户请求属于哪个 SDLC 阶段"
+                "（需求分析 / 技术设计 / 代码生成 / 代码Review / GitHub操作 / 其他），"
+                "并用一到两句话给出简短执行计划。"
+            )
+        ),
+        HumanMessage(content=state["user_query"]),
+    ]
     try:
-        ai = await llm_gateway.ainvoke(
+        plan_obj = await llm_gateway.ainvoke_with_schema(
             prompt,
+            Plan,
             model=state.get("model"),
-            thinking=False,
             callbacks=[trace_callback],
             run_metadata=_run_metadata(state),
         )
-        plan = (ai.text or "").strip()
+        plan_text = f"[{plan_obj.stage}] {plan_obj.description}"
     except Exception:
         logger.exception("planner failed; continuing without a plan")
-        plan = ""
+        plan_text = ""
 
-    if not plan:
-        return {"plan": ""}
-    return {"plan": plan, "messages": [SystemMessage(content=f"[执行规划]\n{plan}")]}
+    return {"plan": plan_text}
 
 
 # ── rag ─────────────────────────────────────────────────────────────────── #
@@ -99,13 +136,32 @@ async def rag(state: AgentState) -> dict:
     )
     new_messages: list = []
     chunks: list[str] = []
+    context = ""
     if docs:
         chunks = [d.page_content for d in docs]
         context = "\n\n".join(chunks)
         new_messages.append(SystemMessage(content=f"参考资料（本 release / project 知识库）：\n{context}"))
 
-    # Append the actual user turn last, right before the agent reasons over it.
-    new_messages.append(HumanMessage(content=state["user_query"]))
+    # A requested template's rendered user portion (may weave in RAG context)
+    # replaces the raw user_query.
+    user_content = state["user_query"]
+    if state.get("prompt_template"):
+        try:
+            tpl = load_template(
+                state["prompt_template"],
+                state.get("prompt_template_version") or "v1",
+            )
+            user_content = tpl.render_user(
+                user_input=state["user_query"],
+                rag_context=context,
+                project_description="",
+                release_name="",
+                tech_stack="",
+            )
+        except FileNotFoundError:
+            pass  # already warned in load_memory
+
+    new_messages.append(HumanMessage(content=user_content))
     return {"rag_chunks": chunks, "messages": new_messages}
 
 

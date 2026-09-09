@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     auth_secret_key: str = "dev-secret-change-me"
     token_expire_hours: int = 72
 
+    # GitHub (optional — raises rate limits for read-only queries; 60/h unauth)
+    github_token: str = ""
+
     def resolve_model(self, name: str | None) -> str:
         """Validate a requested model name, falling back to the default."""
         if name and name in ALLOWED_MODELS:

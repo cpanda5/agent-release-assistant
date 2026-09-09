@@ -25,6 +25,8 @@ class AgentState(TypedDict, total=False):
     enable_thinking: bool | None
     user_query: str
     trace_id: str
+    prompt_template: str | None
+    prompt_template_version: str | None
 
     # Intermediate / output
     plan: str

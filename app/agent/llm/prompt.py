@@ -7,6 +7,13 @@ import yaml
 TEMPLATES_DIR = Path(__file__).parent.parent.parent.parent / "templates"
 
 
+class _SafeDict(dict):
+    """format_map helper: leaves unknown placeholders intact rather than raising."""
+
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
 class PromptTemplate:
     def __init__(self, data: dict):
         self.name: str = data["name"]
@@ -22,17 +29,20 @@ class PromptTemplate:
         Render template variables into a messages list.
         Unknown placeholders are left as-is so missing context doesn't crash.
         """
-
-        class _Safe(dict):
-            def __missing__(self, key: str) -> str:
-                return "{" + key + "}"
-
-        safe = _Safe(**kwargs)
+        safe = _SafeDict(**kwargs)
         messages: list[dict] = []
         if self._system:
             messages.append({"role": "system", "content": self._system.format_map(safe)})
         messages.append({"role": "user", "content": self._user_template.format_map(safe)})
         return messages
+
+    def render_system(self, **kwargs) -> str:
+        """Render just the system portion. Unknown placeholders left intact."""
+        return self._system.format_map(_SafeDict(**kwargs)) if self._system else ""
+
+    def render_user(self, **kwargs) -> str:
+        """Render just the user portion. Unknown placeholders left intact."""
+        return self._user_template.format_map(_SafeDict(**kwargs))
 
 
 @lru_cache(maxsize=64)

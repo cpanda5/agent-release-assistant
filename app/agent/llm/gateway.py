@@ -1,26 +1,26 @@
 """
 LLM Gateway — the single entry point for all LLM I/O.
 
-Refactored from the former hand-rolled ``LLMClient``. The gateway now uses
-LangChain's ``ChatOpenAI`` (pointed at the DashScope-compatible endpoint) as the
-ChatModel, but **keeps the enterprise-grade orchestration** the project already
-had:
+LangChain ``ChatOpenAI`` (DashScope-compatible endpoint) plus the enterprise
+orchestration:
 
   * model selection / validation      → ``settings.resolve_model``
-  * retry with backoff                 → ``llm/retry.with_retry`` (reused)
-  * error classification + fallback    → ``llm/errors.classify_error`` (reused)
+  * retry with backoff                 → ``llm/retry.with_retry``
+  * error classification + fallback    → ``llm/errors.classify_error``
   * observability                      → LangChain callbacks (see ``callbacks.py``)
 
 LangGraph nodes call ``llm_gateway.ainvoke(...)`` / ``llm_gateway.astream(...)``;
 they never construct ChatModels themselves. Tracing is attached by passing a
-callback handler through ``config={"callbacks": [...]}`` — the gateway itself no
-longer writes traces directly.
+callback handler — the gateway does not write traces directly.
 """
 import logging
+
+from typing import Type
 
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel
 
 from app.agent.llm.errors import LLMError, LLMErrorCategory, classify_error
 from app.agent.llm.retry import with_retry
@@ -132,6 +132,63 @@ class LLMGateway:
         try:
             return await runnable.ainvoke(messages, config=config)
         except Exception as exc:  # noqa: BLE001 — re-classified into LLMError
+            raise classify_error(_unwrap(exc)) from exc
+
+    # ------------------------------------------------------------------ #
+    # Public: structured output                                            #
+    # ------------------------------------------------------------------ #
+
+    async def ainvoke_with_schema(
+        self,
+        messages: list[BaseMessage] | list[dict],
+        schema: Type[BaseModel],
+        *,
+        model: str | None = None,
+        callbacks: list | None = None,
+        run_metadata: dict | None = None,
+    ) -> BaseModel:
+        """
+        Invoke the LLM once and return a validated Pydantic instance.
+
+        Uses LangChain's ``with_structured_output`` (JSON-schema function calling
+        on the ChatModel). Retries RETRYABLE errors; on FALLBACK, downgrades to
+        ``settings.fallback_model``. Thinking is forced off — structured output
+        doesn't mix with qwen3.7 deep-thinking.
+        """
+        req_model = self.resolve_model(model)
+
+        chain = [req_model]
+        if settings.fallback_model and settings.fallback_model != req_model:
+            chain.append(settings.fallback_model)
+
+        last_err: LLMError | None = None
+        for m in chain:
+            try:
+                result, _retry_log = await with_retry(
+                    lambda mm=m: self._single_ainvoke_schema(
+                        mm, messages, schema, callbacks, run_metadata
+                    )
+                )
+                return result
+            except LLMError as e:
+                last_err = e
+                if e.category != LLMErrorCategory.FALLBACK:
+                    raise
+        raise last_err  # type: ignore[misc]
+
+    async def _single_ainvoke_schema(
+        self,
+        model: str,
+        messages: list,
+        schema: Type[BaseModel],
+        callbacks: list | None,
+        run_metadata: dict | None,
+    ) -> BaseModel:
+        runnable = self._base_model(model, thinking=False).with_structured_output(schema)
+        config = _build_config(callbacks, run_metadata)
+        try:
+            return await runnable.ainvoke(messages, config=config)
+        except Exception as exc:  # noqa: BLE001
             raise classify_error(_unwrap(exc)) from exc
 
     # ------------------------------------------------------------------ #

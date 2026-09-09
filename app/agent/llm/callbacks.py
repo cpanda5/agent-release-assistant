@@ -1,10 +1,8 @@
 """
 LangChain callback handler that persists LLM call traces to MySQL ``llm_trace``.
 
-The former ``LLMClient`` wrote traces inline; now that LangChain owns the LLM
-invocation we adapt its callback lifecycle to the existing ``tracer.write_trace``
-sink. One row is written per underlying model call (so retries and model
-fallbacks each get their own row — finer-grained than before).
+Adapts the LangChain callback lifecycle to the ``tracer.write_trace`` sink. One
+row per underlying model call (retries and model fallbacks each get a row).
 
 Per-request context (session / release / project) is threaded in via the run's
 ``metadata`` (set by the gateway); LangChain also injects ``ls_*`` metadata such

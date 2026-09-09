@@ -51,4 +51,4 @@ class ChatResponse(BaseModel):
 
 class CloseSessionRequest(BaseModel):
     session_id: str
-    release_id: int | None = None
+    release_id: str | None = None  # release UUID (or legacy numeric id)

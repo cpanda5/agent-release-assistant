@@ -1,13 +1,10 @@
 """
-RAG subsystem settings.
+RAG subsystem settings — a dedicated, self-contained key namespace
+(SiliconFlow / Qdrant / MinIO / chunking) reading the same ``.env`` as
+``app.config``.
 
-Kept in a dedicated ``RagSettings`` (instead of bloating ``app.config.Settings``)
-so the knowledge-base subsystem stays self-contained: it reads the *same* ``.env``
-file but owns its own namespace of keys (SiliconFlow / Qdrant / MinIO / chunking).
-
-Nothing here performs I/O or validates connectivity — construction is cheap and
-side-effect free, so importing the RAG package never touches the network. The
-stores connect lazily on first use and degrade gracefully when unreachable.
+No I/O at import: stores connect lazily on first use and degrade gracefully
+when unreachable.
 """
 from pydantic_settings import BaseSettings, SettingsConfigDict
 

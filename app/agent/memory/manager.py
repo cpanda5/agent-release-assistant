@@ -1,21 +1,13 @@
 """
 MemoryManager — the only class the graph imports from this package.
 
-Four MySQL-backed context layers (no in-process memory state):
+Four MySQL-backed context layers: Project Context (`project`, read-only),
+Release Context (`release_context`), Session Summary (`session_summary`,
+versioned) and Session History (`message`).
 
-  Project Context  — stable background / tech stack (`project` table, read-only)
-  Release Context  — release progress & todos (`release_context`)
-  Session Summary  — versioned compression of older messages (`session_summary`)
-  Session History  — raw messages, source of truth (`message`)
-
-Reads happen once per turn in `load_memory` (build_context); writes happen once
-in `persist_memory` (persist_turn). Session summaries are produced by a
-background task when unsummarized history exceeds a threshold, and finalized
-by close_session (which also merges progress into release_context).
-
-The summary watermark is temporal: each summary row's `created_at` is the
-cutoff up to which messages are covered; replay loads messages newer than the
-latest cutoff (see release.py).
+Reads happen once per turn in `build_context`, writes once in `persist_turn`.
+Summaries are produced by a background task past a size threshold and
+finalized by `close_session`.
 """
 import asyncio
 import logging
@@ -79,8 +71,15 @@ class MemoryManager:
         session_id: str,
         release_id: int | None,
         project_id: int | None,
+        system_prompt_override: str | None = None,
     ) -> AgentContext:
-        """Read all four layers and assemble system prompt + replay history."""
+        """Read all four layers and assemble system prompt + replay history.
+
+        ``system_prompt_override`` replaces the default ``SYSTEM_PROMPT`` as the
+        first system block when a request-level prompt template is active.
+        Project / release / summary blocks are still appended on top, so the
+        agent keeps its workspace context even with a custom template.
+        """
         project_ctx, release_ctx, summary = await asyncio.gather(
             _proj_layer.load_project_context(project_id) if project_id else _noop(None),
             _rel_layer.load_release_context(release_id) if release_id else _noop(None),
@@ -90,7 +89,7 @@ class MemoryManager:
         cutoff = summary["cutoff"] if summary else None
         history = await _rel_layer.load_history(session_id, after=cutoff, limit=_HISTORY_LIMIT)
 
-        system_parts = [SYSTEM_PROMPT]
+        system_parts = [system_prompt_override or SYSTEM_PROMPT]
         for block, cap in (
             (_proj_layer.build_project_prompt_block(project_ctx), _PROJECT_CTX_MAX),
             (_rel_layer.build_release_prompt_block(release_ctx), _RELEASE_CTX_MAX),

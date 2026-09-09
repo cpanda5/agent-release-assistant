@@ -15,6 +15,7 @@ from app.schemas.project import (
     ReleaseOut,
     ReleaseUpdate,
 )
+from app.schemas.session import MessageOut, SessionOut
 
 logger = logging.getLogger(__name__)
 
@@ -173,9 +174,9 @@ async def delete_project(project_uuid: str, user: dict = Depends(get_current_use
 
 # ── Releases ─────────────────────────────────────────────────────────────────── #
 
-async def _owned_release_row(cur, release_uuid: str, owner_pk: int):
+async def _owned_release_row(cur, release_uuid: str, owner_pk: int, row_cols: str = _RELEASE_COLS):
     await cur.execute(
-        f"SELECT {_RELEASE_COLS} FROM releases r "
+        f"SELECT {row_cols} FROM releases r "
         f"JOIN project p ON r.project_id = p.id "
         f"WHERE r.uuid = %s AND p.owner_id = %s "
         f"AND r.deleted_at IS NULL AND p.deleted_at IS NULL",
@@ -275,3 +276,80 @@ async def delete_release(release_uuid: str, user: dict = Depends(get_current_use
             )
             await conn.commit()
     return {"status": "deleted", "uuid": release_uuid}
+
+
+# ── Sessions & history (release-scoped) ────────────────────────────────────── #
+
+@router.get("/releases/{release_uuid}/sessions", response_model=list[SessionOut])
+async def list_release_sessions(
+    release_uuid: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    user: dict = Depends(get_current_user),
+) -> list[SessionOut]:
+    """List chat sessions belonging to a release (newest first)."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            owner_pk = await _user_pk(cur, user["user_uuid"])
+            rel = await _owned_release_row(cur, release_uuid, owner_pk, row_cols="r.id")
+            await cur.execute(
+                "SELECT s.uuid, %s, s.title, s.status, "
+                "  (SELECT COUNT(*) FROM message m "
+                "     WHERE m.session_id = s.id AND m.content_type = 'text' "
+                "       AND m.role IN ('user','assistant')), "
+                "  s.total_tokens, s.created_at, s.updated_at "
+                "FROM sessions s "
+                "WHERE s.release_id = %s AND s.deleted_at IS NULL "
+                "ORDER BY s.created_at DESC LIMIT %s OFFSET %s",
+                (release_uuid, rel[0], limit, offset),
+            )
+            rows = await cur.fetchall()
+    return [
+        SessionOut(
+            uuid=r[0], release_uuid=r[1], title=r[2], status=r[3],
+            message_count=r[4], total_tokens=r[5], created_at=r[6], updated_at=r[7],
+        )
+        for r in rows
+    ]
+
+
+@router.get("/sessions/{session_uuid}/messages", response_model=list[MessageOut])
+async def get_session_messages(
+    session_uuid: str,
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    user: dict = Depends(get_current_user),
+) -> list[MessageOut]:
+    """
+    Full text history of one session (oldest → newest). Accessible when the
+    session's release is owned by the caller, or the session itself was created
+    by them (``sessions.user_id``).
+    """
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            owner_pk = await _user_pk(cur, user["user_uuid"])
+            await cur.execute(
+                "SELECT s.id FROM sessions s "
+                "LEFT JOIN releases r ON s.release_id = r.id AND r.deleted_at IS NULL "
+                "LEFT JOIN project p ON r.project_id = p.id AND p.deleted_at IS NULL "
+                "WHERE s.uuid = %s AND s.deleted_at IS NULL "
+                "  AND (p.owner_id = %s OR s.user_id = %s)",
+                (session_uuid, owner_pk, user["user_uuid"]),
+            )
+            session = await cur.fetchone()
+            if session is None:
+                raise HTTPException(status_code=404, detail="Session not found")
+            await cur.execute(
+                "SELECT uuid, role, content, token_count, created_at FROM message "
+                "WHERE session_id = %s AND content_type = 'text' "
+                "  AND role IN ('user','assistant') "
+                "ORDER BY id ASC LIMIT %s OFFSET %s",
+                (session[0], limit, offset),
+            )
+            rows = await cur.fetchall()
+    return [
+        MessageOut(uuid=r[0], role=r[1], content=r[2], token_count=r[3], created_at=r[4])
+        for r in rows
+    ]
