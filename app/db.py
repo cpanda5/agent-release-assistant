@@ -18,7 +18,7 @@ async def init_db_pool() -> None:
         password=settings.mysql_password,
         db=settings.mysql_db,
         charset="utf8mb4",
-        autocommit=False,
+        autocommit=True,
         minsize=2,
         maxsize=10,
     )
