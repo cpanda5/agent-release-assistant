@@ -53,7 +53,7 @@ POST /agent/chat/stream (SSE) → llm_gateway.astream()  — single turn, separa
 | `app/config.py` | `Settings` + `ALLOWED_MODELS` + `resolve_model()`. Reads `.env`. |
 | `app/main.py` | FastAPI app + lifespan: validates API key, optional MySQL pool, registers tools. CORS open for dev. |
 | `app/auth/` | Simple login/register: `security.py` (stdlib pbkdf2 hash + HMAC-signed Bearer token, no JWT dep), `deps.py` (`get_current_user`), `router.py` (`/auth/register`, `/auth/login`, `/auth/me`). Requires MySQL (503 otherwise). |
-| `app/project/` | Project + Release CRUD (`/projects*`, `/releases*`), Bearer-authenticated, ownership-scoped by `project.owner_id`, soft-delete via `deleted_at`. Frontend contract: `docs/API_frontend.md`. |
+| `app/project/` | Project + Release CRUD (`/projects*`, `/releases*`), Bearer-authenticated, ownership-scoped by `project.owner_id`, soft-delete via `deleted_at`. |
 | `app/agent/router.py` | Endpoints: `/agent/chat`, `/agent/chat/stream`, `/agent/session/close`, `/agent/health`. |
 | `app/agent/core.py` | `invoke_agent()` — thin adapter that invokes the compiled graph. |
 | `app/agent/graph/` | LangGraph workflow: `state.py` (`AgentState`), `nodes.py` (load_memory/planner/rag/agent/tools/persist_memory), `builder.py` (`agent_graph`). |
@@ -64,7 +64,7 @@ POST /agent/chat/stream (SSE) → llm_gateway.astream()  — single turn, separa
 | `app/agent/llm/tracer.py` | `write_trace()` — async MySQL insert into `llm_trace`; never raises. |
 | `app/agent/tools/` | `BaseTool` + `registry` (`to_langchain_tools()`) + `executor` (retry/confirmation/tool_trace). Impls in `tools/impl/`. |
 | `app/agent/memory/` | 4-layer MySQL-backed memory: Project Context (`project` table), Release Context (`release_context`), Session Summary (`session_summary`, versioned, temporal watermark), Session History (`message`). `manager.py` orchestrates load (`build_context`) / write (`persist_turn`) + token budget + background summarization. |
-| `app/agent/rag/` | Knowledge base: hybrid retrieval (`retriever.py`, dense bge-m3 + BM25 sparse, RRF fusion + bge-reranker), ingestion pipeline (`ingest/`), stores (`storage/` — Qdrant/MinIO/MySQL), embeddings (`embed/`), `/knowledge/*` API (`router.py`). Scoped by `release_id`/`project_id`. See `docs/Architecture/rag.md`. |
+| `app/agent/rag/` | Knowledge base: hybrid retrieval (`retriever.py`, dense bge-m3 + BM25 sparse, RRF fusion + bge-reranker), ingestion pipeline (`ingest/`), stores (`storage/` — Qdrant/MinIO/MySQL), embeddings (`embed/`), `/knowledge/*` API (`router.py`). Scoped by `release_id`/`project_id`. |
 | `app/db.py` | `aiomysql` pool. MySQL is optional — if unset/unreachable, tracing + persistence silently skip. |
 | `app/schemas/agent.py` | Pydantic request/response models; requests carry `model` (validated), `user_id`, `enable_thinking`. |
 | `schema.sql` | DDL for sessions/messages/session_summary/release_context/llm_trace/tool_call_trace. |

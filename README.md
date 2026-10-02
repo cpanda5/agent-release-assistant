@@ -294,14 +294,6 @@ app/
 6. **知识沉淀**：会话摘要自动合并到 Release Context，持续积累
 7. **可观测性**：每次 LLM 调用、工具执行写入 trace，支持成本分析
 
-## 后续规划
-
-- Redis 异步入库 Worker（文档解析异步化）
-- Jieba 中文 BM25 分词（提升中文检索效果）
-- 增量重 Embedding（模型更换时自动更新）
-- MQ 异步 Agent 执行（对接 SpringBoot 业务层）
-- 多 Agent 协作（Planner + Executor 分离）
-
 ## License
 
 MIT
